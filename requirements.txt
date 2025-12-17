@@ -3,3 +3,6 @@ google-cloud-documentai
 pandas
 openpyxl
 xlsxwriter
+pymupdf
+Pillow
+
