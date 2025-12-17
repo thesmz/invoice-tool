@@ -5,4 +5,5 @@ openpyxl
 xlsxwriter
 pymupdf
 Pillow
-
+gspread
+oauth2client
