@@ -1,3 +1,4 @@
+import time  # <--- Add this at the top with other imports
 import streamlit as st
 import pandas as pd
 from google.cloud import documentai_v1 as documentai
@@ -281,13 +282,18 @@ if st.session_state.processing_complete:
             with st.spinner("Saving to Google Sheets..."):
                 count = save_to_google_sheets(st.session_state.processed_data, sheet_url, creds_dict)
             
-            st.success(f"✅ Saved {count} invoices!")
+            # Show Success Message
+            st.success(f"✅ SUCCESS! Saved {count} invoices to the Master Sheet.")
             st.balloons()
+            
+            # Wait 3 seconds so you can actually read the message
+            time.sleep(3)
             
             # --- RESET LOGIC ---
             st.session_state.processed_data = []
             st.session_state.processing_complete = False
-            # Change the key to force the File Uploader to clear
+            
+            # Change key to clear the file uploader
             st.session_state.uploader_key = str(uuid.uuid4())
             
             # Reload page
