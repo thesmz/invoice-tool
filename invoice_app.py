@@ -9,11 +9,12 @@ import io
 import fitz  # PyMuPDF
 from PIL import Image
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 import json
+import uuid  # New: For unique IDs
+from google.oauth2.service_account import Credentials # Modern Auth
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="Invoice Processor V5 (Online DB)", layout="wide", page_icon="☁️")
+st.set_page_config(page_title="Invoice Processor V6", layout="wide", page_icon="⚡")
 
 if 'processed_data' not in st.session_state:
     st.session_state.processed_data = []
@@ -53,40 +54,22 @@ def extract_vendor_and_items(filename):
     vendor = ""
     items = ""
     name_without_ext = os.path.splitext(filename)[0]
-    
     items_match = re.search(r'[（(]([^）)]+)[）)]', name_without_ext)
     if items_match:
         items = items_match.group(1).strip()
         name_for_vendor = re.sub(r'[（(][^）)]+[）)]', '', name_without_ext)
     else:
         name_for_vendor = name_without_ext
-        
     name_for_vendor = re.sub(r'^[〇○◯]?\d{6}\s*[-－]\s*', '', name_for_vendor)
     name_for_vendor = re.sub(r'(未払金|買掛金)(計上済|補助なし計上済|[(（]補助なし[)）]計上済)?', '', name_for_vendor)
     vendor = name_for_vendor.strip().strip('-_. ')
     if not vendor: vendor = name_without_ext
     return vendor, items
 
-def delete_amount_callback(invoice_idx, amount_idx):
-    """Callback to safely delete an amount item"""
-    try:
-        del st.session_state.processed_data[invoice_idx]['amounts'][amount_idx]
-    except Exception:
-        pass # Handle cases where index might be invalid
-
 def process_document_ai(file_content, mime_type, project_id, loc, proc_id, creds_dict):
-    # Use dictionary directly instead of file path
     opts = ClientOptions(api_endpoint=f"{loc}-documentai.googleapis.com")
-    
-    # Create client using dictionary credentials
-    from google.oauth2 import service_account
-    credentials = service_account.Credentials.from_service_account_info(creds_dict)
-    
-    client = documentai.DocumentProcessorServiceClient(
-        client_options=opts, 
-        credentials=credentials
-    )
-    
+    credentials = Credentials.from_service_account_info(creds_dict)
+    client = documentai.DocumentProcessorServiceClient(client_options=opts, credentials=credentials)
     name = client.processor_path(project_id, loc, proc_id)
     raw_document = documentai.RawDocument(content=file_content, mime_type=mime_type)
     request = documentai.ProcessRequest(name=name, raw_document=raw_document)
@@ -94,25 +77,10 @@ def process_document_ai(file_content, mime_type, project_id, loc, proc_id, creds
     return result.document
 
 def save_to_google_sheets(new_data, sheet_url, creds_dict):
-    """Updated to use modern google-auth library"""
-    # Use standard google.oauth2 instead of oauth2client
-    from google.oauth2.service_account import Credentials
-    
-    scopes = [
-        'https://www.googleapis.com/auth/spreadsheets',
-        'https://www.googleapis.com/auth/drive'
-    ]
-    
-    # Create credentials using the modern library
+    scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-    
-    # Authorize gspread
     client = gspread.authorize(creds)
-    
-    # Open the sheet
     sheet = client.open_by_url(sheet_url).sheet1
-    
-    # Prepare rows
     rows_to_add = []
     for item in new_data:
         fb_total = 0
@@ -125,7 +93,6 @@ def save_to_google_sheets(new_data, sheet_url, creds_dict):
             elif cat == 'Divide (50/50)':
                 fb_total += val / 2
                 others_total += val / 2
-        
         if fb_total > 0 or others_total > 0:
             rows_to_add.append([
                 item['vendor_name'],
@@ -133,21 +100,35 @@ def save_to_google_sheets(new_data, sheet_url, creds_dict):
                 fb_total if fb_total > 0 else '',
                 others_total if others_total > 0 else ''
             ])
-            
     if rows_to_add:
         sheet.append_rows(rows_to_add)
         return len(rows_to_add)
     return 0
 
+# --- SAFE DELETE CALLBACK ---
+def delete_amount_by_id(invoice_idx, amount_id):
+    """Delete amount using Unique ID to prevent index errors"""
+    invoice = st.session_state.processed_data[invoice_idx]
+    # Filter out the amount with the matching ID
+    invoice['amounts'] = [amt for amt in invoice['amounts'] if amt['id'] != amount_id]
+
 # --- SIDEBAR ---
 with st.sidebar:
     st.header("⚙️ Configuration")
     
-    # Upload Credentials once for both DocAI and Sheets
-    creds_file = st.file_uploader("Credentials JSON", type="json")
-    
+    # 1. Try to load credentials from Secrets (The "No Upload" Way)
+    creds_dict = None
+    if "gcp_service_account" in st.secrets:
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        st.success("🔑 Logged in via Secrets!")
+    else:
+        # Fallback to file upload
+        creds_file = st.file_uploader("Credentials JSON", type="json")
+        if creds_file:
+            creds_dict = json.load(creds_file)
+
     st.markdown("---")
-    st.markdown("**Database Connection**")
+    # 2. Database URL
     sheet_url = st.text_input("Google Sheet URL", placeholder="https://docs.google.com/spreadsheets/d/...")
     
     with st.expander("Doc AI Settings"):
@@ -156,14 +137,11 @@ with st.sidebar:
         processor_id = st.text_input("Processor ID", value="88cff36a297265dc")
 
 # --- MAIN APP ---
-st.title("☁️ Invoice Processor (Online Database)")
+st.title("⚡ Invoice Processor V6")
 
-if not creds_file or not sheet_url:
-    st.info("👋 Please upload your `credentials.json` and paste your Google Sheet URL in the sidebar to start.")
+if not creds_dict or not sheet_url:
+    st.info("👋 Please configure your Credentials and Google Sheet URL in the sidebar.")
     st.stop()
-
-# Load credentials into a dict for reuse
-creds_dict = json.load(creds_file)
 
 # 1. PROCESS SECTION
 uploaded_files = st.file_uploader("1. Upload New Invoices", type=['pdf'], accept_multiple_files=True)
@@ -195,6 +173,7 @@ if start_btn:
             for page, amounts in totals_by_page.items():
                 if amounts:
                     extracted_amounts.append({
+                        "id": str(uuid.uuid4()),  # UNIQUE ID HERE
                         "page": page + 1,
                         "value": max(amounts),
                         "category": "FB Amount"
@@ -215,7 +194,6 @@ if start_btn:
     
     st.session_state.processing_complete = True
 
-# 2. REVIEW SECTION
 # 2. REVIEW SECTION
 if st.session_state.processing_complete:
     st.divider()
@@ -243,31 +221,38 @@ if st.session_state.processing_complete:
                 
                 st.markdown("**Amounts**")
                 
-                # Loop through amounts
-                # Note: We don't check 'if button' anymore. The on_click handles it.
-                for j, amount in enumerate(invoice['amounts']):
+                # Iterate through amounts
+                for amount in invoice['amounts']:
                     c1, c2, c3 = st.columns([2, 3, 1])
                     
-                    new_val = c1.number_input("¥", value=float(amount['value']), key=f"val_{i}_{j}")
-                    st.session_state.processed_data[i]['amounts'][j]['value'] = new_val
+                    # Use ID for keys to ensure Streamlit tracks correct item
+                    u_id = amount['id']
+                    
+                    new_val = c1.number_input("¥", value=float(amount['value']), key=f"val_{u_id}")
+                    # Update value in session state by finding item with ID
+                    for amt in st.session_state.processed_data[i]['amounts']:
+                        if amt['id'] == u_id:
+                            amt['value'] = new_val
                     
                     cat_opts = ["FB Amount", "Others", "Divide (50/50)", "None"]
                     curr_idx = cat_opts.index(amount['category']) if amount['category'] in cat_opts else 0
-                    new_cat = c2.selectbox("Cat", cat_opts, index=curr_idx, key=f"cat_{i}_{j}", label_visibility="collapsed")
-                    st.session_state.processed_data[i]['amounts'][j]['category'] = new_cat
+                    new_cat = c2.selectbox("Cat", cat_opts, index=curr_idx, key=f"cat_{u_id}", label_visibility="collapsed")
+                     # Update category in session state
+                    for amt in st.session_state.processed_data[i]['amounts']:
+                        if amt['id'] == u_id:
+                            amt['category'] = new_cat
                     
-                    # --- THE FIX IS HERE ---
-                    # We use on_click=delete_amount_callback and pass the indices (i, j) as args
+                    # DELETE BUTTON (Uses ID now)
                     c3.button(
                         "🗑️", 
-                        key=f"del_{i}_{j}", 
-                        on_click=delete_amount_callback, 
-                        args=(i, j)
+                        key=f"del_{u_id}", 
+                        on_click=delete_amount_by_id,
+                        args=(i, u_id)
                     )
                 
-                # Add Button
                 if st.button("➕ Add Amount", key=f"add_{i}"):
                     st.session_state.processed_data[i]['amounts'].append({
+                        "id": str(uuid.uuid4()), # Generate new ID
                         "page": selected_page, 
                         "value": 0.0, 
                         "category": "FB Amount"
@@ -284,13 +269,8 @@ if st.session_state.processing_complete:
                 count = save_to_google_sheets(st.session_state.processed_data, sheet_url, creds_dict)
             st.success(f"✅ Successfully saved {count} invoices to the Master Sheet!")
             st.balloons()
-            
-            # Reset workflow
             st.session_state.processed_data = []
             st.session_state.processing_complete = False
             
         except Exception as e:
             st.error(f"Failed to save: {e}")
-            st.info("Make sure you shared the Google Sheet with the email inside your credentials.json file!")
-
-
