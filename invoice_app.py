@@ -67,6 +67,13 @@ def extract_vendor_and_items(filename):
     if not vendor: vendor = name_without_ext
     return vendor, items
 
+def delete_amount_callback(invoice_idx, amount_idx):
+    """Callback to safely delete an amount item"""
+    try:
+        del st.session_state.processed_data[invoice_idx]['amounts'][amount_idx]
+    except Exception:
+        pass # Handle cases where index might be invalid
+
 def process_document_ai(file_content, mime_type, project_id, loc, proc_id, creds_dict):
     # Use dictionary directly instead of file path
     opts = ClientOptions(api_endpoint=f"{loc}-documentai.googleapis.com")
@@ -209,6 +216,7 @@ if start_btn:
     st.session_state.processing_complete = True
 
 # 2. REVIEW SECTION
+# 2. REVIEW SECTION
 if st.session_state.processing_complete:
     st.divider()
     st.subheader("2. Review & Edit")
@@ -234,9 +242,12 @@ if st.session_state.processing_complete:
                 st.session_state.processed_data[i]['items_desc'] = new_items
                 
                 st.markdown("**Amounts**")
-                amounts_to_rem = []
+                
+                # Loop through amounts
+                # Note: We don't check 'if button' anymore. The on_click handles it.
                 for j, amount in enumerate(invoice['amounts']):
                     c1, c2, c3 = st.columns([2, 3, 1])
+                    
                     new_val = c1.number_input("¥", value=float(amount['value']), key=f"val_{i}_{j}")
                     st.session_state.processed_data[i]['amounts'][j]['value'] = new_val
                     
@@ -245,15 +256,22 @@ if st.session_state.processing_complete:
                     new_cat = c2.selectbox("Cat", cat_opts, index=curr_idx, key=f"cat_{i}_{j}", label_visibility="collapsed")
                     st.session_state.processed_data[i]['amounts'][j]['category'] = new_cat
                     
-                    if c3.button("🗑️", key=f"del_{i}_{j}"): amounts_to_rem.append(j)
+                    # --- THE FIX IS HERE ---
+                    # We use on_click=delete_amount_callback and pass the indices (i, j) as args
+                    c3.button(
+                        "🗑️", 
+                        key=f"del_{i}_{j}", 
+                        on_click=delete_amount_callback, 
+                        args=(i, j)
+                    )
                 
-                if amounts_to_rem:
-                    for idx in sorted(amounts_to_rem, reverse=True):
-                        del st.session_state.processed_data[i]['amounts'][idx]
-                    st.rerun()
-                
+                # Add Button
                 if st.button("➕ Add Amount", key=f"add_{i}"):
-                    st.session_state.processed_data[i]['amounts'].append({"page": selected_page, "value": 0.0, "category": "FB Amount"})
+                    st.session_state.processed_data[i]['amounts'].append({
+                        "page": selected_page, 
+                        "value": 0.0, 
+                        "category": "FB Amount"
+                    })
                     st.rerun()
 
     # 3. SAVE SECTION
@@ -274,4 +292,5 @@ if st.session_state.processing_complete:
         except Exception as e:
             st.error(f"Failed to save: {e}")
             st.info("Make sure you shared the Google Sheet with the email inside your credentials.json file!")
+
 
