@@ -183,7 +183,7 @@ with st.sidebar:
         processor_id = st.text_input("Processor ID", value="88cff36a297265dc")
 
 # --- MAIN APP ---
-st.title("📄 Invoice Processor V4")
+st.title("📄 Monthly Invoice Processor")
 
 uploaded_files = st.file_uploader("1. Upload New Invoices", type=['pdf'], accept_multiple_files=True)
 start_btn = st.button("🚀 Process Batch", type="primary", disabled=(not uploaded_files or not creds_file))
@@ -345,4 +345,5 @@ if st.session_state.processing_complete:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary"
         )
+
 
