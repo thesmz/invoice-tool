@@ -87,9 +87,19 @@ def process_document_ai(file_content, mime_type, project_id, loc, proc_id, creds
     return result.document
 
 def save_to_google_sheets(new_data, sheet_url, creds_dict):
-    """Save processed data directly to Google Sheets"""
-    scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+    """Updated to use modern google-auth library"""
+    # Use standard google.oauth2 instead of oauth2client
+    from google.oauth2.service_account import Credentials
+    
+    scopes = [
+        'https://www.googleapis.com/auth/spreadsheets',
+        'https://www.googleapis.com/auth/drive'
+    ]
+    
+    # Create credentials using the modern library
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    
+    # Authorize gspread
     client = gspread.authorize(creds)
     
     # Open the sheet
@@ -264,3 +274,4 @@ if st.session_state.processing_complete:
         except Exception as e:
             st.error(f"Failed to save: {e}")
             st.info("Make sure you shared the Google Sheet with the email inside your credentials.json file!")
+
