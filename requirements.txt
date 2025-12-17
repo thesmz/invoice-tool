@@ -1,0 +1,5 @@
+streamlit
+google-cloud-documentai
+pandas
+xlsxwriter
+openpyxl
