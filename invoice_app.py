@@ -12,7 +12,7 @@ import fitz  # PyMuPDF
 from PIL import Image
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="Invoice Processor V3", layout="wide", page_icon="📄")
+st.set_page_config(page_title="Invoice Processor V4", layout="wide", page_icon="📄")
 
 if 'processed_data' not in st.session_state:
     st.session_state.processed_data = []
@@ -36,6 +36,7 @@ def get_pdf_image(file_bytes, page_num=0):
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         # Safety check for page count
         if page_num >= len(doc): page_num = 0
+        if page_num < 0: page_num = 0
         
         page = doc.load_page(page_num)
         pix = page.get_pixmap(matrix=fitz.Matrix(2, 2)) # 2x zoom for clarity
@@ -43,6 +44,14 @@ def get_pdf_image(file_bytes, page_num=0):
         return img
     except Exception as e:
         return None
+
+def get_page_count(file_bytes):
+    """Get total pages in PDF"""
+    try:
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        return len(doc)
+    except:
+        return 1
 
 def extract_vendor_and_items(filename):
     """Regex logic to guess Vendor and Items"""
@@ -80,17 +89,13 @@ def process_document_ai(file_content, mime_type, project_id, loc, proc_id, crede
 
 def append_to_excel(existing_file, new_data):
     """Append new data to an existing Excel file"""
-    # Load existing workbook
     wb = openpyxl.load_workbook(existing_file)
     
-    # 1. Update Summary Sheet
     if "Invoice Summary" in wb.sheetnames:
         ws = wb["Invoice Summary"]
     else:
         ws = wb.create_sheet("Invoice Summary")
-        # Re-add headers if missing (simplified)
     
-    # Find next empty row
     next_row = ws.max_row + 1
     
     for item in new_data:
@@ -105,19 +110,16 @@ def append_to_excel(existing_file, new_data):
                 fb_total += val / 2
                 others_total += val / 2
         
-        # Only add if there are amounts
         if fb_total > 0 or others_total > 0:
             ws.cell(row=next_row, column=1, value=item['vendor_name'])
             ws.cell(row=next_row, column=2, value=item['items_desc'])
             ws.cell(row=next_row, column=3, value=fb_total if fb_total > 0 else '')
             ws.cell(row=next_row, column=4, value=others_total if others_total > 0 else '')
             
-            # Format
             ws.cell(row=next_row, column=3).number_format = '#,##0'
             ws.cell(row=next_row, column=4).number_format = '#,##0'
             next_row += 1
             
-    # Save to buffer
     output = io.BytesIO()
     wb.save(output)
     return output.getvalue()
@@ -158,7 +160,6 @@ def create_new_excel(data_list):
             others_total if others_total > 0 else ''
         ])
 
-    # Formatting
     ws.column_dimensions['A'].width = 25
     ws.column_dimensions['B'].width = 50
     ws.column_dimensions['C'].width = 25
@@ -182,7 +183,7 @@ with st.sidebar:
         processor_id = st.text_input("Processor ID", value="88cff36a297265dc")
 
 # --- MAIN APP ---
-st.title("📄 Invoice Processor V3")
+st.title("📄 Invoice Processor V4")
 
 uploaded_files = st.file_uploader("1. Upload New Invoices", type=['pdf'], accept_multiple_files=True)
 start_btn = st.button("🚀 Process Batch", type="primary", disabled=(not uploaded_files or not creds_file))
@@ -194,6 +195,10 @@ if start_btn:
     for idx, f in enumerate(uploaded_files):
         # Read file bytes once
         file_bytes = f.read()
+        f.seek(0)
+        
+        # Calculate total pages immediately
+        total_pages = get_page_count(file_bytes)
         f.seek(0)
         
         vendor, items = extract_vendor_and_items(f.name)
@@ -219,7 +224,8 @@ if start_btn:
             
             st.session_state.processed_data.append({
                 "filename": f.name,
-                "file_bytes": file_bytes, # Store bytes for preview
+                "file_bytes": file_bytes,
+                "page_count": total_pages, # Save total pages
                 "vendor_name": vendor,
                 "items_desc": items,
                 "amounts": extracted_amounts
@@ -238,25 +244,39 @@ if st.session_state.processing_complete:
     
     for i, invoice in enumerate(st.session_state.processed_data):
         with st.expander(f"📄 {invoice['vendor_name']}", expanded=(i==0)):
-            # Split Screen: Left = Image, Right = Data
             col_preview, col_data = st.columns([1, 1.2])
             
+            # --- LEFT COLUMN: PREVIEW ---
             with col_preview:
                 st.markdown("**Invoice Preview**")
-                # Show page 1 by default, or the page of the first amount found
-                preview_page = 0
-                if invoice['amounts']:
-                    preview_page = invoice['amounts'][0]['page'] - 1
                 
-                # Render Image
-                img = get_pdf_image(invoice['file_bytes'], preview_page)
+                # Dynamic Page Selector
+                total_pgs = invoice.get('page_count', 1)
+                
+                # Determine default page (if an amount was found, start there, otherwise page 1)
+                default_page = 1
+                if invoice['amounts']:
+                    default_page = invoice['amounts'][0]['page']
+                if default_page > total_pgs: default_page = 1
+                
+                # Page Selector Widget
+                selected_page = st.number_input(
+                    f"Showing Page (Total {total_pgs})", 
+                    min_value=1, 
+                    max_value=total_pgs, 
+                    value=default_page,
+                    key=f"pg_sel_{i}"
+                )
+                
+                # Render Image (0-indexed for fitz, so subtract 1)
+                img = get_pdf_image(invoice['file_bytes'], selected_page - 1)
                 if img:
                     st.image(img, use_container_width=True)
                 else:
                     st.error("Cannot load preview")
 
+            # --- RIGHT COLUMN: DATA ---
             with col_data:
-                # Editable Fields
                 new_vendor = st.text_input("Vendor", value=invoice['vendor_name'], key=f"v_{i}")
                 new_items = st.text_area("Items", value=invoice['items_desc'], height=1, key=f"d_{i}")
                 
@@ -270,7 +290,7 @@ if st.session_state.processing_complete:
                 for j, amount in enumerate(invoice['amounts']):
                     c1, c2, c3 = st.columns([2, 3, 1])
                     
-                    new_val = c1.number_input(f"Page {amount['page']} (¥)", value=float(amount['value']), key=f"val_{i}_{j}")
+                    new_val = c1.number_input(f"Page {amount['page']} Amount", value=float(amount['value']), key=f"val_{i}_{j}")
                     st.session_state.processed_data[i]['amounts'][j]['value'] = new_val
                     
                     cat_opts = ["FB Amount", "Others", "Divide (50/50)", "None"]
@@ -285,9 +305,12 @@ if st.session_state.processing_complete:
                         del st.session_state.processed_data[i]['amounts'][idx]
                     st.rerun()
                 
-                if st.button("➕ Add Amount", key=f"add_{i}"):
+                if st.button("➕ Add Manual Amount", key=f"add_{i}"):
+                    # Default new amount to the currently viewed page in preview
                     st.session_state.processed_data[i]['amounts'].append({
-                        "page": 1, "value": 0.0, "category": "FB Amount"
+                        "page": selected_page, 
+                        "value": 0.0, 
+                        "category": "FB Amount"
                     })
                     st.rerun()
 
@@ -310,7 +333,7 @@ if st.session_state.processing_complete:
             if st.button("💾 Merge & Download"):
                 try:
                     final_data = append_to_excel(existing_excel, st.session_state.processed_data)
-                    file_name = existing_excel.name # Keep original name
+                    file_name = existing_excel.name
                 except Exception as e:
                     st.error(f"Error merging excel: {e}")
 
