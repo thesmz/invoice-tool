@@ -12,7 +12,7 @@ import fitz  # PyMuPDF
 from PIL import Image
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="Invoice Processor V4", layout="wide", page_icon="📄")
+st.set_page_config(page_title="Monthly Invoice Processor", layout="wide", page_icon="📄")
 
 if 'processed_data' not in st.session_state:
     st.session_state.processed_data = []
@@ -345,3 +345,4 @@ if st.session_state.processing_complete:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary"
         )
+
