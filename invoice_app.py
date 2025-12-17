@@ -10,16 +10,21 @@ import fitz  # PyMuPDF
 from PIL import Image
 import gspread
 import json
-import uuid  # New: For unique IDs
-from google.oauth2.service_account import Credentials # Modern Auth
+import uuid
+from google.oauth2.service_account import Credentials
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="Invoice Processor V6", layout="wide", page_icon="⚡")
+st.set_page_config(page_title="Invoice Processor Pro", layout="wide", page_icon="⚡")
 
+# Initialize Session State
 if 'processed_data' not in st.session_state:
     st.session_state.processed_data = []
 if 'processing_complete' not in st.session_state:
     st.session_state.processing_complete = False
+
+# Unique ID to force the File Uploader to reset after saving
+if 'uploader_key' not in st.session_state:
+    st.session_state.uploader_key = str(uuid.uuid4())
 
 # --- HELPER FUNCTIONS ---
 def clean_amount(amount_str):
@@ -54,12 +59,14 @@ def extract_vendor_and_items(filename):
     vendor = ""
     items = ""
     name_without_ext = os.path.splitext(filename)[0]
+    
     items_match = re.search(r'[（(]([^）)]+)[）)]', name_without_ext)
     if items_match:
         items = items_match.group(1).strip()
         name_for_vendor = re.sub(r'[（(][^）)]+[）)]', '', name_without_ext)
     else:
         name_for_vendor = name_without_ext
+        
     name_for_vendor = re.sub(r'^[〇○◯]?\d{6}\s*[-－]\s*', '', name_for_vendor)
     name_for_vendor = re.sub(r'(未払金|買掛金)(計上済|補助なし計上済|[(（]補助なし[)）]計上済)?', '', name_for_vendor)
     vendor = name_for_vendor.strip().strip('-_. ')
@@ -77,10 +84,13 @@ def process_document_ai(file_content, mime_type, project_id, loc, proc_id, creds
     return result.document
 
 def save_to_google_sheets(new_data, sheet_url, creds_dict):
+    # Modern Authentication for GSpread
     scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     client = gspread.authorize(creds)
+    
     sheet = client.open_by_url(sheet_url).sheet1
+    
     rows_to_add = []
     for item in new_data:
         fb_total = 0
@@ -93,6 +103,7 @@ def save_to_google_sheets(new_data, sheet_url, creds_dict):
             elif cat == 'Divide (50/50)':
                 fb_total += val / 2
                 others_total += val / 2
+        
         if fb_total > 0 or others_total > 0:
             rows_to_add.append([
                 item['vendor_name'],
@@ -100,34 +111,35 @@ def save_to_google_sheets(new_data, sheet_url, creds_dict):
                 fb_total if fb_total > 0 else '',
                 others_total if others_total > 0 else ''
             ])
+            
     if rows_to_add:
         sheet.append_rows(rows_to_add)
         return len(rows_to_add)
     return 0
 
-# --- SAFE DELETE CALLBACK ---
+# --- CALLBACKS ---
 def delete_amount_by_id(invoice_idx, amount_id):
-    """Delete amount using Unique ID to prevent index errors"""
+    """Safely delete an amount using its Unique ID"""
     invoice = st.session_state.processed_data[invoice_idx]
-    # Filter out the amount with the matching ID
+    # Keep only amounts that DO NOT match the ID to be deleted
     invoice['amounts'] = [amt for amt in invoice['amounts'] if amt['id'] != amount_id]
 
 # --- SIDEBAR ---
 with st.sidebar:
     st.header("⚙️ Configuration")
     
-    # 1. Try to load credentials from Secrets (The "No Upload" Way)
+    # 1. Credentials (Secrets First, File Second)
     creds_dict = None
     if "gcp_service_account" in st.secrets:
         creds_dict = dict(st.secrets["gcp_service_account"])
-        st.success("🔑 Logged in via Secrets!")
+        st.success("🔑 Auto-logged in via Secrets")
     else:
-        # Fallback to file upload
         creds_file = st.file_uploader("Credentials JSON", type="json")
         if creds_file:
             creds_dict = json.load(creds_file)
 
     st.markdown("---")
+    
     # 2. Database URL
     sheet_url = st.text_input("Google Sheet URL", placeholder="https://docs.google.com/spreadsheets/d/...")
     
@@ -137,14 +149,20 @@ with st.sidebar:
         processor_id = st.text_input("Processor ID", value="88cff36a297265dc")
 
 # --- MAIN APP ---
-st.title("⚡ Invoice Processor V6")
+st.title("⚡ Invoice Processor Pro")
 
 if not creds_dict or not sheet_url:
-    st.info("👋 Please configure your Credentials and Google Sheet URL in the sidebar.")
+    st.info("👋 Please upload your `credentials.json` (or set Secrets) and provide a Google Sheet URL.")
     st.stop()
 
 # 1. PROCESS SECTION
-uploaded_files = st.file_uploader("1. Upload New Invoices", type=['pdf'], accept_multiple_files=True)
+uploaded_files = st.file_uploader(
+    "1. Upload New Invoices", 
+    type=['pdf'], 
+    accept_multiple_files=True,
+    key=st.session_state.uploader_key  # Binds uploader to a dynamic key for resetting
+)
+
 start_btn = st.button("🚀 Process Batch", type="primary", disabled=(not uploaded_files))
 
 if start_btn:
@@ -173,7 +191,7 @@ if start_btn:
             for page, amounts in totals_by_page.items():
                 if amounts:
                     extracted_amounts.append({
-                        "id": str(uuid.uuid4()),  # UNIQUE ID HERE
+                        "id": str(uuid.uuid4()),  # UNIQUE ID ASSIGNED HERE
                         "page": page + 1,
                         "value": max(amounts),
                         "category": "FB Amount"
@@ -221,38 +239,33 @@ if st.session_state.processing_complete:
                 
                 st.markdown("**Amounts**")
                 
-                # Iterate through amounts
                 for amount in invoice['amounts']:
                     c1, c2, c3 = st.columns([2, 3, 1])
+                    u_id = amount['id'] # Grab the unique ID
                     
-                    # Use ID for keys to ensure Streamlit tracks correct item
-                    u_id = amount['id']
-                    
+                    # Update Value
                     new_val = c1.number_input("¥", value=float(amount['value']), key=f"val_{u_id}")
-                    # Update value in session state by finding item with ID
                     for amt in st.session_state.processed_data[i]['amounts']:
-                        if amt['id'] == u_id:
-                            amt['value'] = new_val
+                        if amt['id'] == u_id: amt['value'] = new_val
                     
+                    # Update Category
                     cat_opts = ["FB Amount", "Others", "Divide (50/50)", "None"]
                     curr_idx = cat_opts.index(amount['category']) if amount['category'] in cat_opts else 0
                     new_cat = c2.selectbox("Cat", cat_opts, index=curr_idx, key=f"cat_{u_id}", label_visibility="collapsed")
-                     # Update category in session state
                     for amt in st.session_state.processed_data[i]['amounts']:
-                        if amt['id'] == u_id:
-                            amt['category'] = new_cat
+                        if amt['id'] == u_id: amt['category'] = new_cat
                     
-                    # DELETE BUTTON (Uses ID now)
+                    # DELETE BUTTON (Uses Callback)
                     c3.button(
                         "🗑️", 
                         key=f"del_{u_id}", 
-                        on_click=delete_amount_by_id,
+                        on_click=delete_amount_by_id, 
                         args=(i, u_id)
                     )
                 
                 if st.button("➕ Add Amount", key=f"add_{i}"):
                     st.session_state.processed_data[i]['amounts'].append({
-                        "id": str(uuid.uuid4()), # Generate new ID
+                        "id": str(uuid.uuid4()), # Assign ID for manual entry
                         "page": selected_page, 
                         "value": 0.0, 
                         "category": "FB Amount"
@@ -267,10 +280,18 @@ if st.session_state.processing_complete:
         try:
             with st.spinner("Saving to Google Sheets..."):
                 count = save_to_google_sheets(st.session_state.processed_data, sheet_url, creds_dict)
-            st.success(f"✅ Successfully saved {count} invoices to the Master Sheet!")
+            
+            st.success(f"✅ Saved {count} invoices!")
             st.balloons()
+            
+            # --- RESET LOGIC ---
             st.session_state.processed_data = []
             st.session_state.processing_complete = False
+            # Change the key to force the File Uploader to clear
+            st.session_state.uploader_key = str(uuid.uuid4())
+            
+            # Reload page
+            st.rerun()
             
         except Exception as e:
             st.error(f"Failed to save: {e}")
