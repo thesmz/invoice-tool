@@ -10,7 +10,7 @@ st.set_page_config(page_title="Reconciliation", layout="wide", page_icon="⚖️
 
 # --- AUTHENTICATION ---
 if "gcp_service_account" not in st.secrets:
-    st.error("Secrets not found. Please setup secrets in app.py first.")
+    st.error("Secrets not found.")
     st.stop()
 
 creds_dict = dict(st.secrets["gcp_service_account"])
@@ -18,84 +18,80 @@ scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapi
 creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
 client = gspread.authorize(creds)
 
-# --- ROBUST PARSER (REGEX LOGIC) ---
-def parse_rakuten_pdf(file):
+# --- ROBUST PARSER V3 (ANCHOR LOGIC) ---
+def parse_rakuten_pdf_debug(file):
     """
-    Parses Rakuten Bank PDF by splitting text lines.
-    Structure: [Date] [Description/Vendor] [Withdrawal] [Deposit] [Balance]
+    Parses PDF and captures Raw Text for debugging.
+    Logic: Anchors on Date at Start and Numbers at End.
     """
     transactions = []
+    raw_lines = [] # To show user what we see
     
-    # Regex to find lines starting with Date (e.g., 2025/11/28)
+    # Regex: Start with Date (YYYY/MM/DD)
     date_pattern = re.compile(r'^(\d{4}/\d{1,2}/\d{1,2})')
     
     with pdfplumber.open(file) as pdf:
         for page in pdf.pages:
-            text = page.extract_text()
+            # Try to keep physical layout
+            text = page.extract_text(x_tolerance=2, y_tolerance=2) 
             if not text: continue
             
             lines = text.split('\n')
             for line in lines:
-                # 1. Check if line starts with a Date
+                raw_lines.append(line) # Save for debug view
+                
+                # 1. Find Date at start
                 match = date_pattern.match(line)
                 if match:
                     date_str = match.group(1)
                     
-                    # 2. Split line by whitespace
+                    # 2. Tokenize line
                     parts = line.split()
                     
-                    # Rakuten lines usually look like:
-                    # [2025/11/28] [振込 カ）カガヤ] [150,000] [1,200,000]
-                    # OR
-                    # [2025/11/28] [振込 カ）カガヤ] [150,000] [0] [1,200,000]
-                    
+                    # We need at least: Date, Desc, Amount, Balance (4 parts) 
+                    # OR Date, Desc, Amount (3 parts if balance hidden)
                     if len(parts) < 3: continue
                     
-                    # 3. Extract Numbers from the END of the line backwards
-                    # We collect all valid numbers from the right side
-                    numbers_found = []
+                    # 3. Find numbers from the END backwards
+                    # We expect the last items to be Balance, Deposit, Withdrawal
+                    # Let's collect all valid numbers at the end of the line
+                    numeric_values = []
                     
-                    # Iterate backwards from the end of the line
-                    last_text_index = len(parts) - 1
-                    
-                    for i in range(len(parts) - 1, 0, -1):
-                        token = parts[i].replace(',', '').replace('¥', '')
-                        if token.isdigit():
-                            numbers_found.append(int(token))
-                            last_text_index = i - 1 # Update where text ends
+                    # Walk backwards from the end
+                    # Stop when we hit a string that is NOT a number (e.g., "Kagaya")
+                    for part in reversed(parts):
+                        clean = part.replace(',', '').replace('¥', '')
+                        if clean.isdigit():
+                            numeric_values.append(int(clean))
                         else:
-                            # Stop once we hit non-number text (Description)
-                            break
+                            break # Hit text, stop looking for numbers
                     
-                    # Numbers are collected in reverse: [Balance, Deposit?, Withdrawal]
+                    # numeric_values is now reversed: [Balance, Deposit?, Withdrawal?]
                     # Example: [1200000, 150000] -> Withdrawal is 150000
                     
-                    if len(numbers_found) >= 2:
-                        # Withdrawal is usually the second number from the end (before balance)
-                        # NOTE: Rakuten shows Withdrawal in col 3 and Deposit in col 4.
-                        # If Deposit is empty, it might not appear in text extract.
-                        # Assumption: We only care about Withdrawals (Money Out)
+                    if len(numeric_values) >= 2:
+                        # Standard Case: Last is Balance, 2nd Last is Transaction
+                        amount = numeric_values[1]
                         
-                        # Let's assume the Withdrawal is the number just before Balance.
-                        withdrawal_amt = numbers_found[1] 
+                        # Reconstruct Description
+                        # It's everything between Date (index 0) and the Start of Numbers
+                        # Total tokens = len(parts)
+                        # Number tokens = len(numeric_values)
+                        # Desc tokens = Total - 1 (Date) - Number tokens
                         
-                        # 4. Extract Vendor Name (The Yellow Highlight)
-                        # It is everything between Date (index 0) and the numbers we found
-                        # parts[0] is Date.
-                        # parts[1] to parts[last_text_index] is Description.
-                        
-                        desc_parts = parts[1 : last_text_index + 1]
-                        description = " ".join(desc_parts)
+                        desc_end_index = len(parts) - len(numeric_values)
+                        desc_tokens = parts[1 : desc_end_index]
+                        description = " ".join(desc_tokens)
                         
                         transactions.append({
                             "Date": date_str,
                             "Bank Description": description,
-                            "Amount": withdrawal_amt
+                            "Amount": amount
                         })
-                        
-    return pd.DataFrame(transactions)
+    
+    return pd.DataFrame(transactions), raw_lines
 
-# --- HELPER: GOOGLE SHEETS ---
+# --- HELPER: MAPPING ---
 def load_bank_mapping(sheet_url):
     try:
         sheet = client.open_by_url(sheet_url).worksheet("Bank Mapping")
@@ -114,50 +110,51 @@ def add_unknowns_to_sheet(sheet_url, new_names):
         rows = [[name, ""] for name in new_names]
         sheet.append_rows(rows)
         return True
-    except Exception as e:
-        st.error(f"Error saving to sheet: {e}")
+    except:
         return False
 
 # --- MAIN APP ---
-st.title("⚖️ Monthly Reconciliation")
+st.title("⚖️ Monthly Reconciliation (Debug Mode)")
 
 with st.sidebar:
     st.header("⚙️ Configuration")
     sheet_url = st.text_input("Google Sheet URL", placeholder="https://docs.google.com/spreadsheets/d/...")
 
 if not sheet_url:
-    st.info("Please enter your Google Sheet URL in the sidebar.")
     st.stop()
 
 # 1. UPLOAD
 uploaded_file = st.file_uploader("1. Upload Rakuten PDF", type="pdf")
 
 if uploaded_file:
-    # A. Parse
-    bank_df = parse_rakuten_pdf(uploaded_file)
+    # A. Parse with Debug Info
+    bank_df, raw_text_lines = parse_rakuten_pdf_debug(uploaded_file)
+    
+    # --- DEBUG SECTION ---
+    with st.expander("👀 View Raw PDF Text (Click if parsing fails)", expanded=False):
+        st.write("This is exactly what the computer sees. Check if lines look correct:")
+        st.text("\n".join(raw_text_lines[:20])) # Show first 20 lines
+        st.write("...")
     
     if bank_df.empty:
-        st.error("Could not parse transactions. The PDF format might be different.")
+        st.error("❌ Parsing Failed. No transactions found.")
+        st.info("Check the 'View Raw PDF Text' box above. Does the text look garbled?")
         st.stop()
         
-    st.caption(f"Parsed {len(bank_df)} transactions.")
-    
-    # Debug View (Optional, helps you see if parsing is correct)
-    with st.expander("🔍 Debug: Check Parsed Data"):
-        st.dataframe(bank_df)
+    st.success(f"✅ Successfully parsed {len(bank_df)} transactions!")
 
     # B. Load System Data
     try:
         sheet = client.open_by_url(sheet_url).sheet1
         sys_df = pd.DataFrame(sheet.get_all_records())
         
-        # Smart Column Search (Handles 'FB Amount' vs 'FB Amount (Tax incld.)')
+        # Smart Column Finder
         status_col = next((c for c in sys_df.columns if "Status" in c), None)
         fb_col = next((c for c in sys_df.columns if "FB" in c and "Amount" in c), None)
         vendor_col = next((c for c in sys_df.columns if "Vendor" in c), None)
         
         if not all([status_col, fb_col, vendor_col]):
-            st.error("Missing columns in Google Sheet (Status, Vendor, or FB Amount)")
+            st.error("Missing columns in Google Sheet.")
             st.stop()
             
         paid_invoices = sys_df[sys_df[status_col] == "Paid"].copy()
@@ -168,7 +165,7 @@ if uploaded_file:
     # C. Load Map
     mapping_dict = load_bank_mapping(sheet_url)
     
-    # D. Match
+    # D. Match Logic
     matches = []
     unmatched_bank = []
     unknown_names = set()
