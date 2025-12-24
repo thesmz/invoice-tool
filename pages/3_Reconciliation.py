@@ -8,7 +8,6 @@ import time
 st.set_page_config(page_title="Reconciliation", layout="wide", page_icon="⚖️")
 
 # --- 1. CONFIGURATION ---
-# Items containing these words will be completely ignored (Hidden)
 SKIP_KEYWORDS = [
     "振込手数料",       # Transfer Fees
     "カイガイソウキン",  # Overseas Remittance fees
@@ -25,17 +24,37 @@ if "gcp_service_account" not in st.secrets:
 
 creds_dict = dict(st.secrets["gcp_service_account"])
 
-# --- 3. PARSER: RAKUTEN TRANSACTION HISTORY ---
+# --- 3. PARSER: ROBUST CSV READER ---
 def parse_rakuten_csv(file):
     transactions = []
+    df = None
     
-    # Read the file (Try UTF-8, then Shift-JIS)
+    # ATTEMPT 1: UTF-8 with BOM (Common for Excel CSVs)
     try:
         file.seek(0)
-        df = pd.read_csv(file) # Default UTF-8
+        df = pd.read_csv(file, encoding='utf-8-sig')
     except:
-        file.seek(0)
-        df = pd.read_csv(file, encoding='cp932') # Japanese Windows
+        pass
+
+    # ATTEMPT 2: Japanese Windows (CP932)
+    if df is None:
+        try:
+            file.seek(0)
+            df = pd.read_csv(file, encoding='cp932')
+        except:
+            pass
+            
+    # ATTEMPT 3: Standard UTF-8
+    if df is None:
+        try:
+            file.seek(0)
+            df = pd.read_csv(file, encoding='utf-8')
+        except:
+            pass
+
+    if df is None:
+        st.error("Could not read file. Please ensure it is a valid CSV.")
+        return pd.DataFrame()
 
     # Clean headers (remove spaces)
     df.columns = [str(c).strip() for c in df.columns]
@@ -47,7 +66,7 @@ def parse_rakuten_csv(file):
     desc_col = next((c for c in df.columns if "内容" in c), None)
     
     if not all([date_col, amt_col, desc_col]):
-        st.error("Error: CSV must have '取引日', '入出金(円)', and '入出金先内容' columns.")
+        st.error(f"Error: Missing columns. Found: {list(df.columns)}")
         return pd.DataFrame()
 
     for _, row in df.iterrows():
@@ -67,7 +86,6 @@ def parse_rakuten_csv(file):
             clean_desc = clean_desc.split('(依頼人')[0]
             
             # 2. Try to remove Bank Name at the start (e.g. "三井住友銀行...")
-            # Pattern: If it has spaces, the Vendor is usually the last or 2nd to last item.
             parts = clean_desc.split(' ')
             if len(parts) >= 4 and any(b in parts[0] for b in ['銀行', '金庫', '組合']):
                 # It's likely [Bank] [Branch] [Type] [Num] [VENDOR]
@@ -79,9 +97,11 @@ def parse_rakuten_csv(file):
             vendor_name = vendor_name.strip()
 
             # D. Amount
-            # Rakuten format: "-193,168"
+            # Rakuten format: "-193,168" or "1,000"
             amount_str = str(row[amt_col]).replace(',', '')
-            amount = int(float(amount_str)) # Float conversion handles .0 safety
+            # Handle empty or invalid amounts
+            if not amount_str or amount_str == 'nan': continue
+            amount = int(float(amount_str)) 
             
             # E. Date
             # Rakuten format: "20251104" -> "2025/11/04"
@@ -151,7 +171,7 @@ if uploaded_file:
     bank_df = parse_rakuten_csv(uploaded_file)
     
     if bank_df.empty:
-        st.error("No valid withdrawal transactions found. Check if the file is correct.")
+        st.error("No valid transactions found. Please check the file format.")
         st.stop()
         
     st.success(f"✅ Loaded {len(bank_df)} transactions (Fees & Debit skipped).")
