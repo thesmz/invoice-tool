@@ -61,7 +61,6 @@ def add_unknowns_to_sheet(sheet_url, new_names):
     """Bulk append new Japanese names to the mapping sheet"""
     try:
         sheet = client.open_by_url(sheet_url).worksheet("Bank Mapping")
-        # Prepare rows: [Japanese Name, ""]
         rows = [[name, ""] for name in new_names]
         sheet.append_rows(rows)
         return True
@@ -97,12 +96,20 @@ if uploaded_file:
         sys_data = sheet.get_all_records()
         sys_df = pd.DataFrame(sys_data)
         
-        # Check if 'Status' column exists
-        if "Status" not in sys_df.columns:
-            st.error("Your Invoice Sheet is missing the 'Status' column.")
+        # --- FIX: SMART COLUMN FINDER ---
+        # Find the actual column name for "Status" and "FB Amount"
+        # because it might be "FB Amount" OR "FB Amount (Tax incld.)"
+        
+        status_col = next((col for col in sys_df.columns if "Status" in col), None)
+        fb_col = next((col for col in sys_df.columns if "FB" in col and "Amount" in col), None)
+        vendor_col = next((col for col in sys_df.columns if "Vendor" in col), None)
+
+        if not status_col or not fb_col or not vendor_col:
+            st.error(f"Could not find required columns in your Google Sheet.\nLooking for: Status, Vendor, FB Amount.\nFound: {list(sys_df.columns)}")
             st.stop()
             
-        paid_invoices = sys_df[sys_df["Status"] == "Paid"].copy()
+        paid_invoices = sys_df[sys_df[status_col] == "Paid"].copy()
+        
     except Exception as e:
         st.error(f"Error loading Invoice Sheet: {e}")
         st.stop()
@@ -113,7 +120,7 @@ if uploaded_file:
     # --- MATCHING LOGIC ---
     matches = []
     unmatched_bank = []
-    unknown_names_found = set() # Track unique unknown Japanese names
+    unknown_names_found = set()
     
     for idx, bank_row in bank_df.iterrows():
         bank_desc = bank_row['Bank Description']
@@ -122,25 +129,22 @@ if uploaded_file:
         # 1. Try to translate
         translated_name = "Unknown"
         
-        # Exact match check first
         if bank_desc in mapping_dict:
             translated_name = mapping_dict[bank_desc]
         else:
-            # Partial match check
             for kana, eng in mapping_dict.items():
                 if kana in bank_desc:
                     translated_name = eng
                     break
         
-        # If still unknown, add to our list to save later
         if translated_name == "Unknown":
             unknown_names_found.add(bank_desc)
         
         # 2. Look for matching invoice
-        # Criteria: Same Vendor Name AND Same Amount
+        # Use the dynamic column names found above
         match = paid_invoices[
-            (paid_invoices['Vendor Name'] == translated_name) & 
-            (paid_invoices['FB Amount'] == bank_amt)
+            (paid_invoices[vendor_col] == translated_name) & 
+            (paid_invoices[fb_col] == bank_amt)
         ]
         
         if not match.empty:
@@ -163,10 +167,8 @@ if uploaded_file:
     # --- DISPLAY RESULTS ---
     st.divider()
     
-    # Show "Action Needed" box if there are unknown names
     if unknown_names_found:
         st.warning(f"⚠️ Found {len(unknown_names_found)} unknown Japanese vendor names.")
-        
         col_act1, col_act2 = st.columns([1, 2])
         with col_act1:
             if st.button("☁️ Auto-Add Unknowns to Mapping Sheet", type="primary"):
