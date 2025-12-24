@@ -7,3 +7,5 @@ pymupdf
 Pillow
 gspread
 oauth2client
+pdfplumber
+
