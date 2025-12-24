@@ -1,8 +1,9 @@
 import streamlit as st
 import pandas as pd
-import pdfplumber
 import gspread
 from google.oauth2.service_account import Credentials
+from google.cloud import documentai_v1 as documentai
+from google.api_core.client_options import ClientOptions
 import re
 import time
 
@@ -10,90 +11,92 @@ st.set_page_config(page_title="Reconciliation", layout="wide", page_icon="⚖️
 
 # --- AUTHENTICATION ---
 if "gcp_service_account" not in st.secrets:
-    st.error("Secrets not found.")
+    st.error("Secrets not found. Please setup secrets in app.py first.")
     st.stop()
 
 creds_dict = dict(st.secrets["gcp_service_account"])
-scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-client = gspread.authorize(creds)
 
-# --- ROBUST PARSER V3 (ANCHOR LOGIC) ---
-def parse_rakuten_pdf_debug(file):
-    """
-    Parses PDF and captures Raw Text for debugging.
-    Logic: Anchors on Date at Start and Numbers at End.
-    """
-    transactions = []
-    raw_lines = [] # To show user what we see
+# --- HELPER: CALL GOOGLE DOC AI ---
+def get_text_from_docai(file_content, project_id, loc, proc_id):
+    """Sends PDF to Google and returns the full text string"""
+    opts = ClientOptions(api_endpoint=f"{loc}-documentai.googleapis.com")
+    creds = Credentials.from_service_account_info(creds_dict)
+    client = documentai.DocumentProcessorServiceClient(client_options=opts, credentials=creds)
     
-    # Regex: Start with Date (YYYY/MM/DD)
+    name = client.processor_path(project_id, loc, proc_id)
+    raw_document = documentai.RawDocument(content=file_content, mime_type="application/pdf")
+    request = documentai.ProcessRequest(name=name, raw_document=raw_document)
+    
+    result = client.process_document(request=request)
+    return result.document.text
+
+# --- PARSER: REGEX LOGIC ---
+def parse_docai_text(full_text):
+    """Parses the raw text string returned by Google"""
+    transactions = []
+    
+    # 1. Split into lines
+    lines = full_text.split('\n')
+    
+    # Regex for Date (YYYY/MM/DD)
     date_pattern = re.compile(r'^(\d{4}/\d{1,2}/\d{1,2})')
     
-    with pdfplumber.open(file) as pdf:
-        for page in pdf.pages:
-            # Try to keep physical layout
-            text = page.extract_text(x_tolerance=2, y_tolerance=2) 
-            if not text: continue
+    for line in lines:
+        line = line.strip()
+        if not line: continue
+        
+        # 2. Check for Date at start
+        match = date_pattern.match(line)
+        if match:
+            date_str = match.group(1)
             
-            lines = text.split('\n')
-            for line in lines:
-                raw_lines.append(line) # Save for debug view
+            # 3. Tokenize
+            parts = line.split()
+            if len(parts) < 3: continue
+            
+            # 4. Find Numbers from the END (Backwards)
+            # Logic: We expect [Desc] [Withdrawal] [Deposit] [Balance]
+            # We want the 'Withdrawal' amount.
+            
+            numeric_values = []
+            for part in reversed(parts):
+                clean = part.replace(',', '').replace('¥', '')
+                if clean.isdigit():
+                    numeric_values.append(int(clean))
+                else:
+                    break # Stop when we hit text
+            
+            # Usually: [Balance, Deposit(0), Withdrawal] or [Balance, Withdrawal]
+            # Rakuten Example: 2025/11/28  振込 カ）カガヤ  150,000  1,200,000
+            # Numeric found (reversed): [1200000, 150000]
+            
+            if len(numeric_values) >= 2:
+                # The Withdrawal is the one BEFORE the Balance (which is last)
+                withdrawal = numeric_values[1] 
                 
-                # 1. Find Date at start
-                match = date_pattern.match(line)
-                if match:
-                    date_str = match.group(1)
-                    
-                    # 2. Tokenize line
-                    parts = line.split()
-                    
-                    # We need at least: Date, Desc, Amount, Balance (4 parts) 
-                    # OR Date, Desc, Amount (3 parts if balance hidden)
-                    if len(parts) < 3: continue
-                    
-                    # 3. Find numbers from the END backwards
-                    # We expect the last items to be Balance, Deposit, Withdrawal
-                    # Let's collect all valid numbers at the end of the line
-                    numeric_values = []
-                    
-                    # Walk backwards from the end
-                    # Stop when we hit a string that is NOT a number (e.g., "Kagaya")
-                    for part in reversed(parts):
-                        clean = part.replace(',', '').replace('¥', '')
-                        if clean.isdigit():
-                            numeric_values.append(int(clean))
-                        else:
-                            break # Hit text, stop looking for numbers
-                    
-                    # numeric_values is now reversed: [Balance, Deposit?, Withdrawal?]
-                    # Example: [1200000, 150000] -> Withdrawal is 150000
-                    
-                    if len(numeric_values) >= 2:
-                        # Standard Case: Last is Balance, 2nd Last is Transaction
-                        amount = numeric_values[1]
-                        
-                        # Reconstruct Description
-                        # It's everything between Date (index 0) and the Start of Numbers
-                        # Total tokens = len(parts)
-                        # Number tokens = len(numeric_values)
-                        # Desc tokens = Total - 1 (Date) - Number tokens
-                        
-                        desc_end_index = len(parts) - len(numeric_values)
-                        desc_tokens = parts[1 : desc_end_index]
-                        description = " ".join(desc_tokens)
-                        
-                        transactions.append({
-                            "Date": date_str,
-                            "Bank Description": description,
-                            "Amount": amount
-                        })
-    
-    return pd.DataFrame(transactions), raw_lines
+                # 5. Extract Vendor (Yellow Part)
+                # Everything between Date and the Numbers
+                # parts[0] is Date.
+                # numeric_values covers the last N tokens.
+                
+                desc_end_index = len(parts) - len(numeric_values)
+                desc_tokens = parts[1 : desc_end_index]
+                description = " ".join(desc_tokens)
+                
+                transactions.append({
+                    "Date": date_str,
+                    "Bank Description": description,
+                    "Amount": withdrawal
+                })
+                
+    return pd.DataFrame(transactions)
 
-# --- HELPER: MAPPING ---
+# --- HELPER: GOOGLE SHEETS ---
 def load_bank_mapping(sheet_url):
     try:
+        scopes = ['https://www.googleapis.com/auth/spreadsheets']
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        client = gspread.authorize(creds)
         sheet = client.open_by_url(sheet_url).worksheet("Bank Mapping")
         records = sheet.get_all_values()
         mapping = {}
@@ -106,6 +109,9 @@ def load_bank_mapping(sheet_url):
 
 def add_unknowns_to_sheet(sheet_url, new_names):
     try:
+        scopes = ['https://www.googleapis.com/auth/spreadsheets']
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        client = gspread.authorize(creds)
         sheet = client.open_by_url(sheet_url).worksheet("Bank Mapping")
         rows = [[name, ""] for name in new_names]
         sheet.append_rows(rows)
@@ -114,11 +120,16 @@ def add_unknowns_to_sheet(sheet_url, new_names):
         return False
 
 # --- MAIN APP ---
-st.title("⚖️ Monthly Reconciliation (Debug Mode)")
+st.title("⚖️ Monthly Reconciliation (Powered by Doc AI)")
 
 with st.sidebar:
     st.header("⚙️ Configuration")
     sheet_url = st.text_input("Google Sheet URL", placeholder="https://docs.google.com/spreadsheets/d/...")
+    
+    with st.expander("Doc AI Settings (Same as Invoices)"):
+        project_id = st.text_input("Project ID", value="receipt-processor-479605")
+        location = st.selectbox("Location", ["us", "eu"], index=0)
+        processor_id = st.text_input("Processor ID", value="88cff36a297265dc")
 
 if not sheet_url:
     st.stop()
@@ -127,24 +138,30 @@ if not sheet_url:
 uploaded_file = st.file_uploader("1. Upload Rakuten PDF", type="pdf")
 
 if uploaded_file:
-    # A. Parse with Debug Info
-    bank_df, raw_text_lines = parse_rakuten_pdf_debug(uploaded_file)
-    
-    # --- DEBUG SECTION ---
-    with st.expander("👀 View Raw PDF Text (Click if parsing fails)", expanded=False):
-        st.write("This is exactly what the computer sees. Check if lines look correct:")
-        st.text("\n".join(raw_text_lines[:20])) # Show first 20 lines
-        st.write("...")
+    # A. Use Google AI to Read Text
+    with st.spinner("🤖 Google AI is reading the Japanese text..."):
+        file_content = uploaded_file.read()
+        try:
+            full_text = get_text_from_docai(file_content, project_id, location, processor_id)
+            bank_df = parse_docai_text(full_text)
+        except Exception as e:
+            st.error(f"Google AI Failed: {e}")
+            st.stop()
     
     if bank_df.empty:
-        st.error("❌ Parsing Failed. No transactions found.")
-        st.info("Check the 'View Raw PDF Text' box above. Does the text look garbled?")
+        st.error("AI read the file but found no transactions. Check layout.")
+        with st.expander("See Raw AI Text"):
+            st.text(full_text)
         st.stop()
         
-    st.success(f"✅ Successfully parsed {len(bank_df)} transactions!")
+    st.success(f"✅ AI successfully read {len(bank_df)} transactions!")
 
     # B. Load System Data
     try:
+        scopes = ['https://www.googleapis.com/auth/spreadsheets']
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        client = gspread.authorize(creds)
+        
         sheet = client.open_by_url(sheet_url).sheet1
         sys_df = pd.DataFrame(sheet.get_all_records())
         
