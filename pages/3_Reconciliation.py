@@ -10,11 +10,11 @@ st.set_page_config(page_title="Reconciliation", layout="wide", page_icon="⚖️
 # --- 1. CONFIGURATION ---
 SKIP_KEYWORDS = [
     "振込手数料",       # Transfer Fees
-    "カイガイソウキン",  # Overseas Remittance fees
-    "JCBデビット",      # Debit Card usage
-    "PE",             # PayEasy (Taxes/Gov)
-    "手数料",          # Generic fees
-    "口振"            # Auto-withdrawals
+    "カイガイソウキン",  # Overseas Remittance
+    "JCBデビット",      # Debit Card
+    "PE",             # PayEasy (Gov/Tax)
+    "手数料",          # Generic Fees
+    "口振"            # Auto-withdrawal
 ]
 
 # --- 2. AUTHENTICATION ---
@@ -24,94 +24,104 @@ if "gcp_service_account" not in st.secrets:
 
 creds_dict = dict(st.secrets["gcp_service_account"])
 
-# --- 3. PARSER: ROBUST CSV READER ---
-def parse_rakuten_csv(file):
+# --- 3. PARSER: UNIVERSAL READER (Excel OR CSV) ---
+def parse_rakuten_file(file):
     transactions = []
     df = None
     
-    # ATTEMPT 1: UTF-8 with BOM (Common for Excel CSVs)
+    # STRATEGY 1: Try reading as Excel (.xlsx)
+    # This works if the file is truly "xlsv" (xlsx)
     try:
-        file.seek(0)
-        df = pd.read_csv(file, encoding='utf-8-sig')
+        df = pd.read_excel(file)
     except:
         pass
+    
+    # STRATEGY 2: Try reading as CSV (UTF-8 with BOM)
+    # This fixes the "0xef" error you saw earlier
+    if df is None:
+        try:
+            file.seek(0)
+            df = pd.read_csv(file, encoding='utf-8-sig')
+        except:
+            pass
 
-    # ATTEMPT 2: Japanese Windows (CP932)
+    # STRATEGY 3: Try reading as CSV (Japanese Shift-JIS)
     if df is None:
         try:
             file.seek(0)
             df = pd.read_csv(file, encoding='cp932')
         except:
             pass
-            
-    # ATTEMPT 3: Standard UTF-8
-    if df is None:
-        try:
-            file.seek(0)
-            df = pd.read_csv(file, encoding='utf-8')
-        except:
-            pass
 
     if df is None:
-        st.error("Could not read file. Please ensure it is a valid CSV.")
+        st.error("Could not read the file. Please ensure it is a valid .xlsx or .csv file.")
         return pd.DataFrame()
 
-    # Clean headers (remove spaces)
+    # --- NORMALIZE HEADERS ---
+    # Convert all headers to string and remove spaces/newlines
     df.columns = [str(c).strip() for c in df.columns]
     
-    # Identify required columns
+    # Identify Columns
     # We look for: '取引日', '入出金(円)', '入出金先内容'
     date_col = next((c for c in df.columns if "取引日" in c), None)
     amt_col = next((c for c in df.columns if "入出金" in c and "内容" not in c), None)
     desc_col = next((c for c in df.columns if "内容" in c), None)
     
     if not all([date_col, amt_col, desc_col]):
-        st.error(f"Error: Missing columns. Found: {list(df.columns)}")
+        st.error(f"Error: Columns not found. Found: {list(df.columns)}")
         return pd.DataFrame()
 
+    # --- PROCESS ROWS ---
     for _, row in df.iterrows():
         try:
-            # A. Extract Description & Normalize
+            # A. DESCRIPTION
             raw_desc = str(row[desc_col]).strip()
-            # Converts "ヤサカ　（カ" (Full Width) -> "ヤサカ (カ" (Normal)
+            # Normalize Half-width to Full-width (ヤサカ -> ヤサカ)
             norm_desc = unicodedata.normalize('NFKC', raw_desc)
             
-            # B. SKIP LOGIC (Ignore fees/taxes)
+            # B. SKIP LOGIC
             if any(keyword in norm_desc for keyword in SKIP_KEYWORDS):
                 continue
             
-            # C. Extract Vendor Name (Remove Bank Info & Client Info)
-            # 1. Remove "(依頼人..." info at the end
+            # C. CLEAN VENDOR NAME
+            # Remove (依頼人...)
             clean_desc = norm_desc.split(' (依頼人')[0]
             clean_desc = clean_desc.split('(依頼人')[0]
             
-            # 2. Try to remove Bank Name at the start (e.g. "三井住友銀行...")
+            # Remove Bank Name prefixes (if present)
             parts = clean_desc.split(' ')
             if len(parts) >= 4 and any(b in parts[0] for b in ['銀行', '金庫', '組合']):
-                # It's likely [Bank] [Branch] [Type] [Num] [VENDOR]
-                # We take the part after the Account Number
+                # Take everything after the 4th space (Bank Branch Type Num Name)
                 vendor_name = " ".join(parts[4:]) 
             else:
                 vendor_name = clean_desc
 
             vendor_name = vendor_name.strip()
 
-            # D. Amount
-            # Rakuten format: "-193,168" or "1,000"
-            amount_str = str(row[amt_col]).replace(',', '')
-            # Handle empty or invalid amounts
-            if not amount_str or amount_str == 'nan': continue
-            amount = int(float(amount_str)) 
+            # D. AMOUNT
+            # Handle string numbers ("-1,200") or actual numbers (-1200)
+            val = row[amt_col]
+            if pd.isna(val): continue
             
-            # E. Date
-            # Rakuten format: "20251104" -> "2025/11/04"
-            raw_date = str(row[date_col])
-            if len(raw_date) == 8:
-                date_str = f"{raw_date[:4]}/{raw_date[4:6]}/{raw_date[6:]}"
+            if isinstance(val, str):
+                amount = int(float(val.replace(',', '')))
             else:
-                date_str = raw_date
+                amount = int(val)
+            
+            # E. DATE
+            # Handle String "20251104" OR Excel Timestamp
+            raw_date = row[date_col]
+            if isinstance(raw_date, pd.Timestamp):
+                date_str = raw_date.strftime("%Y/%m/%d")
+            else:
+                # Assume string "20251104"
+                s_date = str(raw_date).replace('/', '') # Clean slashes if any
+                if len(s_date) == 8:
+                    date_str = f"{s_date[:4]}/{s_date[4:6]}/{s_date[6:]}"
+                else:
+                    date_str = str(raw_date)
 
-            # Only process Withdrawals (Negative numbers)
+            # Only Keep Withdrawals
             if amount < 0:
                 transactions.append({
                     "Date": date_str,
@@ -165,16 +175,17 @@ if not sheet_url:
     st.stop()
 
 # UPLOAD
-uploaded_file = st.file_uploader("1. Upload 'Transaction History' CSV", type=["csv", "xlsx"])
+uploaded_file = st.file_uploader("1. Upload Bank File (Excel or CSV)", type=["xlsx", "csv"])
 
 if uploaded_file:
-    bank_df = parse_rakuten_csv(uploaded_file)
+    # Use Universal Parser
+    bank_df = parse_rakuten_file(uploaded_file)
     
     if bank_df.empty:
-        st.error("No valid transactions found. Please check the file format.")
+        st.error("No valid transactions found. Please check the file.")
         st.stop()
         
-    st.success(f"✅ Loaded {len(bank_df)} transactions (Fees & Debit skipped).")
+    st.success(f"✅ Loaded {len(bank_df)} transactions.")
 
     # LOAD SYSTEM DATA
     try:
@@ -184,13 +195,12 @@ if uploaded_file:
         sheet = client.open_by_url(sheet_url).sheet1
         sys_df = pd.DataFrame(sheet.get_all_records())
         
-        # Check Columns
         status_col = next((c for c in sys_df.columns if "Status" in c), None)
         fb_col = next((c for c in sys_df.columns if "FB" in c and "Amount" in c), None)
         vendor_col = next((c for c in sys_df.columns if "Vendor" in c), None)
         
         if not all([status_col, fb_col, vendor_col]):
-            st.error("Your Google Sheet is missing 'Status', 'Vendor Name', or 'FB Amount'.")
+            st.error("Google Sheet missing required columns.")
             st.stop()
             
         paid_invoices = sys_df[sys_df[status_col] == "Paid"].copy()
@@ -221,7 +231,7 @@ if uploaded_file:
         if trans_name == "Unknown":
             unknown_names.add(bank_desc)
             
-        # Check for Match
+        # Match
         match = paid_invoices[
             (paid_invoices[vendor_col] == trans_name) & 
             (paid_invoices[fb_col] == bank_amt)
