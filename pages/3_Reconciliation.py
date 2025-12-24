@@ -4,6 +4,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 import unicodedata
 import time
+import re
 
 st.set_page_config(page_title="Reconciliation", layout="wide", page_icon="⚖️")
 
@@ -24,20 +25,49 @@ if "gcp_service_account" not in st.secrets:
 
 creds_dict = dict(st.secrets["gcp_service_account"])
 
-# --- 3. PARSER: UNIVERSAL READER (Excel OR CSV) ---
+# --- 3. HELPER: UNIVERSAL TEXT NORMALIZER (Algorithmic) ---
+def normalize_japanese_text(text):
+    """
+    辞書を使わず、Unicodeの仕組みを使って自動的に濁点を結合する関数
+    """
+    if not isinstance(text, str):
+        return str(text)
+
+    # 1. まず標準正規化 (NFKC)
+    # これで半角カナは全角になり、半角の濁点は結合されます。
+    # しかし「全角の基底文字」+「全角の独立した濁点」の組み合わせは、これだけでは結合されません。
+    text = unicodedata.normalize('NFKC', text)
+    
+    # 2. 独立した濁点・半濁点を「結合用文字」に置換する (ここがミソ)
+    # \u309B (全角濁点 ゛) -> \u3099 (結合用濁点)
+    # \u309C (全角半濁点 ゜) -> \u309A (結合用半濁点)
+    text = text.replace('\u309B', '\u3099').replace('\u309C', '\u309A')
+    
+    # 3. もう一度正規化 (NFC)
+    # 結合用文字は、前の文字と自動的に合体して1文字になります (カ + ゛ -> ガ)
+    text = unicodedata.normalize('NFC', text)
+    
+    # 4. 記号の統一 (ハイフン類を長音「ー」へ)
+    # 銀行データはマイナス記号などが混在しやすいため統一します
+    text = text.replace('-', 'ー').replace('−', 'ー').replace('‐', 'ー')
+    
+    # 5. 余計な空白の削除
+    text = text.replace('　', ' ').strip()
+    
+    return text
+
+# --- 4. PARSER: UNIVERSAL READER ---
 def parse_rakuten_file(file):
     transactions = []
     df = None
     
-    # STRATEGY 1: Try reading as Excel (.xlsx)
-    # This works if the file is truly "xlsv" (xlsx)
+    # STRATEGY 1: Excel (.xlsx)
     try:
         df = pd.read_excel(file)
     except:
         pass
     
-    # STRATEGY 2: Try reading as CSV (UTF-8 with BOM)
-    # This fixes the "0xef" error you saw earlier
+    # STRATEGY 2: CSV (UTF-8 with BOM)
     if df is None:
         try:
             file.seek(0)
@@ -45,7 +75,7 @@ def parse_rakuten_file(file):
         except:
             pass
 
-    # STRATEGY 3: Try reading as CSV (Japanese Shift-JIS)
+    # STRATEGY 3: CSV (CP932 / Shift-JIS)
     if df is None:
         try:
             file.seek(0)
@@ -57,12 +87,10 @@ def parse_rakuten_file(file):
         st.error("Could not read the file. Please ensure it is a valid .xlsx or .csv file.")
         return pd.DataFrame()
 
-    # --- NORMALIZE HEADERS ---
-    # Convert all headers to string and remove spaces/newlines
+    # Normalize Headers
     df.columns = [str(c).strip() for c in df.columns]
     
     # Identify Columns
-    # We look for: '取引日', '入出金(円)', '入出金先内容'
     date_col = next((c for c in df.columns if "取引日" in c), None)
     amt_col = next((c for c in df.columns if "入出金" in c and "内容" not in c), None)
     desc_col = next((c for c in df.columns if "内容" in c), None)
@@ -71,13 +99,12 @@ def parse_rakuten_file(file):
         st.error(f"Error: Columns not found. Found: {list(df.columns)}")
         return pd.DataFrame()
 
-    # --- PROCESS ROWS ---
+    # Process Rows
     for _, row in df.iterrows():
         try:
-            # A. DESCRIPTION
+            # A. DESCRIPTION & NORMALIZE
             raw_desc = str(row[desc_col]).strip()
-            # Normalize Half-width to Full-width (ヤサカ -> ヤサカ)
-            norm_desc = unicodedata.normalize('NFKC', raw_desc)
+            norm_desc = normalize_japanese_text(raw_desc)
             
             # B. SKIP LOGIC
             if any(keyword in norm_desc for keyword in SKIP_KEYWORDS):
@@ -88,10 +115,10 @@ def parse_rakuten_file(file):
             clean_desc = norm_desc.split(' (依頼人')[0]
             clean_desc = clean_desc.split('(依頼人')[0]
             
-            # Remove Bank Name prefixes (if present)
+            # Remove Bank Name prefixes
+            # Logic: If 4+ spaces and starts with Bank, take the tail
             parts = clean_desc.split(' ')
             if len(parts) >= 4 and any(b in parts[0] for b in ['銀行', '金庫', '組合']):
-                # Take everything after the 4th space (Bank Branch Type Num Name)
                 vendor_name = " ".join(parts[4:]) 
             else:
                 vendor_name = clean_desc
@@ -99,7 +126,6 @@ def parse_rakuten_file(file):
             vendor_name = vendor_name.strip()
 
             # D. AMOUNT
-            # Handle string numbers ("-1,200") or actual numbers (-1200)
             val = row[amt_col]
             if pd.isna(val): continue
             
@@ -109,13 +135,11 @@ def parse_rakuten_file(file):
                 amount = int(val)
             
             # E. DATE
-            # Handle String "20251104" OR Excel Timestamp
             raw_date = row[date_col]
             if isinstance(raw_date, pd.Timestamp):
                 date_str = raw_date.strftime("%Y/%m/%d")
             else:
-                # Assume string "20251104"
-                s_date = str(raw_date).replace('/', '') # Clean slashes if any
+                s_date = str(raw_date).replace('/', '')
                 if len(s_date) == 8:
                     date_str = f"{s_date[:4]}/{s_date[4:6]}/{s_date[6:]}"
                 else:
@@ -126,7 +150,7 @@ def parse_rakuten_file(file):
                 transactions.append({
                     "Date": date_str,
                     "Bank Description": vendor_name,
-                    "Amount": abs(amount) # Positive for matching
+                    "Amount": abs(amount)
                 })
 
         except Exception:
@@ -134,7 +158,7 @@ def parse_rakuten_file(file):
             
     return pd.DataFrame(transactions)
 
-# --- 4. GOOGLE SHEETS HELPERS ---
+# --- 5. GOOGLE SHEETS HELPERS ---
 def load_bank_mapping(sheet_url):
     try:
         scopes = ['https://www.googleapis.com/auth/spreadsheets']
@@ -145,7 +169,8 @@ def load_bank_mapping(sheet_url):
         mapping = {}
         for row in records[1:]:
             if len(row) >= 2 and row[0]:
-                key = unicodedata.normalize('NFKC', row[0].strip())
+                # Keys in mapping sheet should also be normalized!
+                key = normalize_japanese_text(row[0])
                 mapping[key] = row[1].strip()
         return mapping
     except:
@@ -163,7 +188,7 @@ def add_unknowns_to_sheet(sheet_url, new_names):
     except:
         return False
 
-# --- 5. MAIN APP ---
+# --- 6. MAIN APP ---
 st.title("⚖️ Monthly Reconciliation")
 
 with st.sidebar:
@@ -186,6 +211,10 @@ if uploaded_file:
         st.stop()
         
     st.success(f"✅ Loaded {len(bank_df)} transactions.")
+    
+    # Optional: Debug view to see if text is fixed
+    with st.expander("🔍 Check Parsed Names (Debug)"):
+        st.dataframe(bank_df.head())
 
     # LOAD SYSTEM DATA
     try:
