@@ -1,11 +1,10 @@
 streamlit
 google-cloud-documentai
 pandas
-openpyxl
-xlsxwriter
+gspread
 pymupdf
 Pillow
-gspread
-oauth2client
+google-auth
 pdfplumber
-
+openpyxl
+xlsxwriter
