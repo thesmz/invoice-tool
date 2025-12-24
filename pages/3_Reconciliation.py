@@ -3,6 +3,7 @@ import pandas as pd
 import pdfplumber
 import gspread
 from google.oauth2.service_account import Credentials
+import re
 import time
 
 st.set_page_config(page_title="Reconciliation", layout="wide", page_icon="⚖️")
@@ -17,30 +18,81 @@ scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapi
 creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
 client = gspread.authorize(creds)
 
-# --- HELPER: PARSE RAKUTEN PDF ---
+# --- ROBUST PARSER (REGEX LOGIC) ---
 def parse_rakuten_pdf(file):
-    """Extracts Date, Description, and Withdrawal Amount from Rakuten PDF"""
+    """
+    Parses Rakuten Bank PDF by splitting text lines.
+    Structure: [Date] [Description/Vendor] [Withdrawal] [Deposit] [Balance]
+    """
     transactions = []
+    
+    # Regex to find lines starting with Date (e.g., 2025/11/28)
+    date_pattern = re.compile(r'^(\d{4}/\d{1,2}/\d{1,2})')
+    
     with pdfplumber.open(file) as pdf:
         for page in pdf.pages:
-            table = page.extract_table()
-            if table:
-                for row in table:
-                    # Rakuten Format check (Date | Desc | Withdrawal ...)
-                    if not row or len(row) < 3: continue
+            text = page.extract_text()
+            if not text: continue
+            
+            lines = text.split('\n')
+            for line in lines:
+                # 1. Check if line starts with a Date
+                match = date_pattern.match(line)
+                if match:
+                    date_str = match.group(1)
                     
-                    date_str = row[0]
-                    desc = row[1]
-                    withdrawal = row[2]
+                    # 2. Split line by whitespace
+                    parts = line.split()
                     
-                    if withdrawal and isinstance(withdrawal, str):
-                        clean_w = withdrawal.replace(',', '').replace('¥', '').strip()
-                        if clean_w.isdigit() and int(clean_w) > 0:
-                            transactions.append({
-                                "Date": date_str.replace('\n', ''), 
-                                "Bank Description": desc.replace('\n', ' ').strip(),
-                                "Amount": int(clean_w)
-                            })
+                    # Rakuten lines usually look like:
+                    # [2025/11/28] [振込 カ）カガヤ] [150,000] [1,200,000]
+                    # OR
+                    # [2025/11/28] [振込 カ）カガヤ] [150,000] [0] [1,200,000]
+                    
+                    if len(parts) < 3: continue
+                    
+                    # 3. Extract Numbers from the END of the line backwards
+                    # We collect all valid numbers from the right side
+                    numbers_found = []
+                    
+                    # Iterate backwards from the end of the line
+                    last_text_index = len(parts) - 1
+                    
+                    for i in range(len(parts) - 1, 0, -1):
+                        token = parts[i].replace(',', '').replace('¥', '')
+                        if token.isdigit():
+                            numbers_found.append(int(token))
+                            last_text_index = i - 1 # Update where text ends
+                        else:
+                            # Stop once we hit non-number text (Description)
+                            break
+                    
+                    # Numbers are collected in reverse: [Balance, Deposit?, Withdrawal]
+                    # Example: [1200000, 150000] -> Withdrawal is 150000
+                    
+                    if len(numbers_found) >= 2:
+                        # Withdrawal is usually the second number from the end (before balance)
+                        # NOTE: Rakuten shows Withdrawal in col 3 and Deposit in col 4.
+                        # If Deposit is empty, it might not appear in text extract.
+                        # Assumption: We only care about Withdrawals (Money Out)
+                        
+                        # Let's assume the Withdrawal is the number just before Balance.
+                        withdrawal_amt = numbers_found[1] 
+                        
+                        # 4. Extract Vendor Name (The Yellow Highlight)
+                        # It is everything between Date (index 0) and the numbers we found
+                        # parts[0] is Date.
+                        # parts[1] to parts[last_text_index] is Description.
+                        
+                        desc_parts = parts[1 : last_text_index + 1]
+                        description = " ".join(desc_parts)
+                        
+                        transactions.append({
+                            "Date": date_str,
+                            "Bank Description": description,
+                            "Amount": withdrawal_amt
+                        })
+                        
     return pd.DataFrame(transactions)
 
 # --- HELPER: GOOGLE SHEETS ---
@@ -49,7 +101,6 @@ def load_bank_mapping(sheet_url):
         sheet = client.open_by_url(sheet_url).worksheet("Bank Mapping")
         records = sheet.get_all_values()
         mapping = {}
-        # Skip header row (index 0)
         for row in records[1:]:
             if len(row) >= 2 and row[0]:
                 mapping[row[0].strip()] = row[1].strip()
@@ -58,7 +109,6 @@ def load_bank_mapping(sheet_url):
         return {}
 
 def add_unknowns_to_sheet(sheet_url, new_names):
-    """Bulk append new Japanese names to the mapping sheet"""
     try:
         sheet = client.open_by_url(sheet_url).worksheet("Bank Mapping")
         rows = [[name, ""] for name in new_names]
@@ -79,116 +129,102 @@ if not sheet_url:
     st.info("Please enter your Google Sheet URL in the sidebar.")
     st.stop()
 
-# 1. UPLOAD BANK STATEMENT
+# 1. UPLOAD
 uploaded_file = st.file_uploader("1. Upload Rakuten PDF", type="pdf")
 
 if uploaded_file:
-    # A. Parse Bank Data
+    # A. Parse
     bank_df = parse_rakuten_pdf(uploaded_file)
     
     if bank_df.empty:
-        st.error("Could not find any withdrawal transactions in this PDF.")
+        st.error("Could not parse transactions. The PDF format might be different.")
         st.stop()
+        
+    st.caption(f"Parsed {len(bank_df)} transactions.")
+    
+    # Debug View (Optional, helps you see if parsing is correct)
+    with st.expander("🔍 Debug: Check Parsed Data"):
+        st.dataframe(bank_df)
 
-    # B. Load System Data (Paid Invoices Only)
+    # B. Load System Data
     try:
         sheet = client.open_by_url(sheet_url).sheet1
-        sys_data = sheet.get_all_records()
-        sys_df = pd.DataFrame(sys_data)
+        sys_df = pd.DataFrame(sheet.get_all_records())
         
-        # --- FIX: SMART COLUMN FINDER ---
-        # Find the actual column name for "Status" and "FB Amount"
-        # because it might be "FB Amount" OR "FB Amount (Tax incld.)"
+        # Smart Column Search (Handles 'FB Amount' vs 'FB Amount (Tax incld.)')
+        status_col = next((c for c in sys_df.columns if "Status" in c), None)
+        fb_col = next((c for c in sys_df.columns if "FB" in c and "Amount" in c), None)
+        vendor_col = next((c for c in sys_df.columns if "Vendor" in c), None)
         
-        status_col = next((col for col in sys_df.columns if "Status" in col), None)
-        fb_col = next((col for col in sys_df.columns if "FB" in col and "Amount" in col), None)
-        vendor_col = next((col for col in sys_df.columns if "Vendor" in col), None)
-
-        if not status_col or not fb_col or not vendor_col:
-            st.error(f"Could not find required columns in your Google Sheet.\nLooking for: Status, Vendor, FB Amount.\nFound: {list(sys_df.columns)}")
+        if not all([status_col, fb_col, vendor_col]):
+            st.error("Missing columns in Google Sheet (Status, Vendor, or FB Amount)")
             st.stop()
             
         paid_invoices = sys_df[sys_df[status_col] == "Paid"].copy()
-        
     except Exception as e:
-        st.error(f"Error loading Invoice Sheet: {e}")
+        st.error(f"Error loading sheet: {e}")
         st.stop()
-    
-    # C. Load Translation Map
+
+    # C. Load Map
     mapping_dict = load_bank_mapping(sheet_url)
     
-    # --- MATCHING LOGIC ---
+    # D. Match
     matches = []
     unmatched_bank = []
-    unknown_names_found = set()
+    unknown_names = set()
     
-    for idx, bank_row in bank_df.iterrows():
-        bank_desc = bank_row['Bank Description']
-        bank_amt = bank_row['Amount']
+    for idx, row in bank_df.iterrows():
+        bank_desc = row['Bank Description']
+        bank_amt = row['Amount']
         
-        # 1. Try to translate
-        translated_name = "Unknown"
-        
+        # Translate
+        trans_name = "Unknown"
         if bank_desc in mapping_dict:
-            translated_name = mapping_dict[bank_desc]
+            trans_name = mapping_dict[bank_desc]
         else:
-            for kana, eng in mapping_dict.items():
-                if kana in bank_desc:
-                    translated_name = eng
+            for k, v in mapping_dict.items():
+                if k in bank_desc:
+                    trans_name = v
                     break
         
-        if translated_name == "Unknown":
-            unknown_names_found.add(bank_desc)
-        
-        # 2. Look for matching invoice
-        # Use the dynamic column names found above
+        if trans_name == "Unknown":
+            unknown_names.add(bank_desc)
+            
+        # Match
         match = paid_invoices[
-            (paid_invoices[vendor_col] == translated_name) & 
+            (paid_invoices[vendor_col] == trans_name) & 
             (paid_invoices[fb_col] == bank_amt)
         ]
         
         if not match.empty:
             matches.append({
-                "Date": bank_row['Date'],
+                "Date": row['Date'],
                 "Bank Name": bank_desc,
-                "System Name": translated_name,
+                "System Name": trans_name,
                 "Amount": f"¥{bank_amt:,.0f}",
                 "Status": "✅ Match"
             })
         else:
             unmatched_bank.append({
-                "Date": bank_row['Date'],
+                "Date": row['Date'],
                 "Bank Name": bank_desc,
-                "Translated": translated_name,
+                "Translated": trans_name,
                 "Amount": f"¥{bank_amt:,.0f}",
                 "Status": "❌ Missing"
             })
 
-    # --- DISPLAY RESULTS ---
+    # E. Display
     st.divider()
+    if unknown_names:
+        st.warning(f"Found {len(unknown_names)} unknown names.")
+        if st.button("☁️ Auto-Add Unknowns"):
+            add_unknowns_to_sheet(sheet_url, list(unknown_names))
+            st.success("Added! Please refresh.")
     
-    if unknown_names_found:
-        st.warning(f"⚠️ Found {len(unknown_names_found)} unknown Japanese vendor names.")
-        col_act1, col_act2 = st.columns([1, 2])
-        with col_act1:
-            if st.button("☁️ Auto-Add Unknowns to Mapping Sheet", type="primary"):
-                with st.spinner("Saving to Google Sheets..."):
-                    success = add_unknowns_to_sheet(sheet_url, list(unknown_names_found))
-                    if success:
-                        st.success("✅ Added! Open your Google Sheet 'Bank Mapping' tab and type the English names.")
-                        time.sleep(3)
-                        st.rerun()
-
     c1, c2 = st.columns(2)
-    
     with c1:
-        st.subheader(f"✅ Matched ({len(matches)})")
-        if matches:
-            st.dataframe(pd.DataFrame(matches), hide_index=True, use_container_width=True)
-        else:
-            st.info("No matches found yet.")
-
+        st.subheader("✅ Matched")
+        st.dataframe(matches)
     with c2:
-        st.subheader(f"❌ Unmatched / Unknown ({len(unmatched_bank)})")
-        if unmatched_bank:
-            st.dataframe(pd.DataFrame(unmatched_bank), hide_index=True, use_container_width=True)
+        st.subheader("❌ Unmatched")
+        st.dataframe(unmatched_bank)
