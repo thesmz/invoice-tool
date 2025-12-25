@@ -9,68 +9,42 @@ import time
 st.set_page_config(page_title="Reconciliation", layout="wide", page_icon="⚖️")
 
 # --- 1. CONFIGURATION ---
-# If a line contains these, we skip it entirely (Fees, Debits, etc.)
 SKIP_KEYWORDS = [
     "振込手数料", "カイガイソウキン", "JCBデビット", "PE", "手数料", "口振"
 ]
 
 # --- 2. SMART TEXT NORMALIZER ---
 def smart_normalize(text):
-    """
-    The 'Smarter' Cleaner.
-    1. Glues separated dots (ヘ ゛ -> ベ) even if there are spaces.
-    2. Standardizes all characters to Full-Width (NFKC).
-    3. Standardizes dashes and spaces.
-    """
     if not isinstance(text, str): return str(text)
-
-    # A. Aggressive Glue: Remove spaces before Dakuten/Handakuten
-    # Matches [Space(s)] + [Dakuten] and replaces with just [Dakuten]
+    # Aggressive Glue: Remove spaces before dots
     text = re.sub(r'\s+([゛゜ﾞﾟ])', r'\1', text)
-
-    # B. Convert Standalone Dakuten to "Combining" Dakuten
-    # This tells the computer: "These dots belong to the previous letter"
-    text = text.replace('\u309B', '\u3099').replace('\u309C', '\u309A') # Full-width
-    text = text.replace('ﾞ', '\u3099').replace('ﾟ', '\u309A')           # Half-width
-    
-    # C. Apply Unicode Normalization (NFC) -> Actually merges the characters
+    # Convert separate dots to combined dots
+    text = text.replace('\u309B', '\u3099').replace('\u309C', '\u309A')
+    text = text.replace('ﾞ', '\u3099').replace('ﾟ', '\u309A')
+    # Normalize
     text = unicodedata.normalize('NFC', text)
-    
-    # D. Apply Compatibility Normalization (NFKC) -> Fixes Half-width Kana
     text = unicodedata.normalize('NFKC', text)
-
-    # E. Final Cleanup (Dashes and Spaces)
+    # Cleanup
     text = text.replace('-', 'ー').replace('−', 'ー').replace('‐', 'ー')
     text = text.replace('　', ' ').strip()
-    
     return text
 
 # --- 3. UNIVERSAL FILE READER ---
 def read_rakuten_file(file):
-    """Reads Excel or CSV (UTF-8/Shift-JIS) automatically."""
     df = None
-    
-    # Try Excel
     try: df = pd.read_excel(file)
     except: pass
-    
-    # Try CSV (Excel-style UTF-8)
     if df is None:
         try:
             file.seek(0)
             df = pd.read_csv(file, encoding='utf-8-sig')
         except: pass
-
-    # Try CSV (Japanese Shift-JIS)
     if df is None:
         try:
             file.seek(0)
             df = pd.read_csv(file, encoding='cp932')
         except: pass
-
     if df is None: return pd.DataFrame()
-
-    # Clean Headers
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
@@ -78,7 +52,6 @@ def read_rakuten_file(file):
 def parse_transactions(df):
     transactions = []
     
-    # Find Columns
     date_col = next((c for c in df.columns if "取引日" in c), None)
     amt_col = next((c for c in df.columns if "入出金" in c and "内容" not in c), None)
     desc_col = next((c for c in df.columns if "内容" in c), None)
@@ -89,19 +62,14 @@ def parse_transactions(df):
 
     for _, row in df.iterrows():
         try:
-            # 1. Clean Description
             raw_desc = str(row[desc_col])
             clean_desc = smart_normalize(raw_desc)
-            
-            # 2. Skip Logic
             if any(k in clean_desc for k in SKIP_KEYWORDS): continue
             
-            # 3. Clean Amount
             val = row[amt_col]
             if pd.isna(val): continue
             amount = int(float(str(val).replace(',', '')))
             
-            # 4. Clean Date
             raw_date = row[date_col]
             if isinstance(raw_date, pd.Timestamp):
                 date_str = raw_date.strftime("%Y/%m/%d")
@@ -109,11 +77,10 @@ def parse_transactions(df):
                 s = str(raw_date).replace('/', '')
                 date_str = f"{s[:4]}/{s[4:6]}/{s[6:]}" if len(s) == 8 else str(raw_date)
 
-            # 5. Only Withdrawals
             if amount < 0:
                 transactions.append({
                     "Date": date_str,
-                    "Bank Description": clean_desc, # We keep the FULL string (Safe!)
+                    "Bank Description": clean_desc,
                     "Amount": abs(amount)
                 })
         except:
@@ -136,12 +103,10 @@ def load_mapping(sheet_url):
     try:
         client = get_gsheet_client()
         sheet = client.open_by_url(sheet_url).worksheet("Bank Mapping")
-        # Read as dict: { "タカナシハンバイ": "Takanashi Sales" }
         records = sheet.get_all_values()
         mapping = {}
         for row in records[1:]:
             if len(row) >= 2 and row[0]:
-                # Normalize the key too!
                 key = smart_normalize(row[0])
                 mapping[key] = row[1].strip()
         return mapping
@@ -173,18 +138,30 @@ if uploaded_file:
     bank_df = parse_transactions(raw_df)
     st.success(f"✅ Loaded {len(bank_df)} withdrawals.")
 
-    # B. Load System Data
+    # B. Load System Data (FIXED: SMART COLUMN FINDER)
     client = get_gsheet_client()
     try:
         sys_data = client.open_by_url(sheet_url).sheet1.get_all_records()
         sys_df = pd.DataFrame(sys_data)
         
-        # Check cols
-        if not all(k in sys_df.columns for k in ["Status", "Vendor Name", "FB Amount"]):
-            st.error("Sheet needs columns: Status, Vendor Name, FB Amount")
+        # --- FIX STARTS HERE ---
+        # Look for columns that *contain* keywords instead of exact match
+        status_col = next((c for c in sys_df.columns if "Status" in c), None)
+        vendor_col = next((c for c in sys_df.columns if "Vendor" in c), None)
+        fb_col = next((c for c in sys_df.columns if "FB" in c and "Amount" in c), None)
+        
+        if not all([status_col, vendor_col, fb_col]):
+            st.error(f"❌ Missing columns! Found: {list(sys_df.columns)}. Need: 'Status', 'Vendor', 'FB Amount'")
             st.stop()
             
-        paid_invoices = sys_df[sys_df["Status"] == "Paid"].copy()
+        # Rename them internally so the rest of the code works
+        paid_invoices = sys_df[sys_df[status_col] == "Paid"].copy()
+        paid_invoices = paid_invoices.rename(columns={
+            vendor_col: "Vendor Name",
+            fb_col: "FB Amount"
+        })
+        # --- FIX ENDS HERE ---
+        
     except Exception as e:
         st.error(f"Sheet Error: {e}")
         st.stop()
@@ -199,20 +176,16 @@ if uploaded_file:
         bank_desc = row['Bank Description']
         amount = row['Amount']
         
-        # 1. Find mapped name
-        # Logic: Does the long Bank Description CONTAIN any key from our mapping?
-        # This handles prefixes/suffixes automatically!
+        # 1. Match Mapping
         matched_name = None
-        
         for key, val in mapping.items():
-            if key in bank_desc: # "MITSUBISHI... YASAKA..." contains "YASAKA"
+            if key in bank_desc: 
                 matched_name = val
                 break
         
-        # 2. Match with System
+        # 2. Match System
         status = "❌ Missing"
         if matched_name:
-            # Look for Vendor + Amount in System
             sys_match = paid_invoices[
                 (paid_invoices["Vendor Name"] == matched_name) & 
                 (paid_invoices["FB Amount"] == amount)
@@ -245,24 +218,17 @@ if uploaded_file:
         st.subheader(f"❌ Unmatched ({len(unmatched)})")
         st.dataframe(unmatched, use_container_width=True)
         
-        # E. Quick Add to Mapping
         if unmatched:
             st.write("---")
             st.write("### 📝 Quick Map")
-            # Select an unmatched item to map
             options = [u['Bank Description'] for u in unmatched if u['Mapped Vendor'] == "Unknown"]
             if options:
-                selected_desc = st.selectbox("Select Bank Description to Map", options)
-                new_alias = st.text_input("Enter Key Word (e.g. 'ヤサカ')", help="Copy the unique part of the bank name here.")
+                selected_desc = st.selectbox("Select Bank Description", options)
+                new_alias = st.text_input("Enter Key Word (e.g. 'ヤサカ')")
                 
                 if st.button("Save to Mapping Sheet"):
                     if new_alias:
-                        # We save the ALIAS (Short name) -> English Name
-                        # But wait, usually we want to map:
-                        # "ヤサカ" -> "Yasaka Taxi"
-                        # User needs to ensure the Mapping Sheet has "Yasaka Taxi" in Col B.
-                        
                         add_mapping(sheet_url, new_alias, "") 
-                        st.success(f"Added '{new_alias}' to mapping! Go to your sheet and add the English name in Column B.")
+                        st.success(f"Added '{new_alias}'! Add English Name in Sheet.")
                         time.sleep(3)
                         st.rerun()
