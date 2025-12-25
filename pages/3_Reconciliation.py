@@ -3,309 +3,266 @@ import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 import unicodedata
-import time
 import re
+import time
 
 st.set_page_config(page_title="Reconciliation", layout="wide", page_icon="⚖️")
 
 # --- 1. CONFIGURATION ---
+# If a line contains these, we skip it entirely (Fees, Debits, etc.)
 SKIP_KEYWORDS = [
-    "振込手数料",       # Transfer Fees
-    "カイガイソウキン",  # Overseas Remittance
-    "JCBデビット",      # Debit Card
-    "PE",             # PayEasy (Gov/Tax)
-    "手数料",          # Generic Fees
-    "口振"            # Auto-withdrawal
+    "振込手数料", "カイガイソウキン", "JCBデビット", "PE", "手数料", "口振"
 ]
 
-# --- 2. AUTHENTICATION ---
-if "gcp_service_account" not in st.secrets:
-    st.error("Secrets not found.")
-    st.stop()
-
-creds_dict = dict(st.secrets["gcp_service_account"])
-
-# --- 3. HELPER: UNIVERSAL TEXT NORMALIZER (Algorithmic) ---
-def normalize_japanese_text(text):
+# --- 2. SMART TEXT NORMALIZER ---
+def smart_normalize(text):
     """
-    辞書を使わず、Unicodeの仕組みを使って自動的に濁点を結合する関数
+    The 'Smarter' Cleaner.
+    1. Glues separated dots (ヘ ゛ -> ベ) even if there are spaces.
+    2. Standardizes all characters to Full-Width (NFKC).
+    3. Standardizes dashes and spaces.
     """
-    if not isinstance(text, str):
-        return str(text)
+    if not isinstance(text, str): return str(text)
 
-    # 1. まず標準正規化 (NFKC)
-    # これで半角カナは全角になり、半角の濁点は結合されます。
-    # しかし「全角の基底文字」+「全角の独立した濁点」の組み合わせは、これだけでは結合されません。
-    text = unicodedata.normalize('NFKC', text)
+    # A. Aggressive Glue: Remove spaces before Dakuten/Handakuten
+    # Matches [Space(s)] + [Dakuten] and replaces with just [Dakuten]
+    text = re.sub(r'\s+([゛゜ﾞﾟ])', r'\1', text)
+
+    # B. Convert Standalone Dakuten to "Combining" Dakuten
+    # This tells the computer: "These dots belong to the previous letter"
+    text = text.replace('\u309B', '\u3099').replace('\u309C', '\u309A') # Full-width
+    text = text.replace('ﾞ', '\u3099').replace('ﾟ', '\u309A')           # Half-width
     
-    # 2. 独立した濁点・半濁点を「結合用文字」に置換する (ここがミソ)
-    # \u309B (全角濁点 ゛) -> \u3099 (結合用濁点)
-    # \u309C (全角半濁点 ゜) -> \u309A (結合用半濁点)
-    text = text.replace('\u309B', '\u3099').replace('\u309C', '\u309A')
-    
-    # 3. もう一度正規化 (NFC)
-    # 結合用文字は、前の文字と自動的に合体して1文字になります (カ + ゛ -> ガ)
+    # C. Apply Unicode Normalization (NFC) -> Actually merges the characters
     text = unicodedata.normalize('NFC', text)
     
-    # 4. 記号の統一 (ハイフン類を長音「ー」へ)
-    # 銀行データはマイナス記号などが混在しやすいため統一します
+    # D. Apply Compatibility Normalization (NFKC) -> Fixes Half-width Kana
+    text = unicodedata.normalize('NFKC', text)
+
+    # E. Final Cleanup (Dashes and Spaces)
     text = text.replace('-', 'ー').replace('−', 'ー').replace('‐', 'ー')
-    
-    # 5. 余計な空白の削除
     text = text.replace('　', ' ').strip()
     
     return text
 
-# --- 4. PARSER: UNIVERSAL READER ---
-def parse_rakuten_file(file):
-    transactions = []
+# --- 3. UNIVERSAL FILE READER ---
+def read_rakuten_file(file):
+    """Reads Excel or CSV (UTF-8/Shift-JIS) automatically."""
     df = None
     
-    # STRATEGY 1: Excel (.xlsx)
-    try:
-        df = pd.read_excel(file)
-    except:
-        pass
+    # Try Excel
+    try: df = pd.read_excel(file)
+    except: pass
     
-    # STRATEGY 2: CSV (UTF-8 with BOM)
+    # Try CSV (Excel-style UTF-8)
     if df is None:
         try:
             file.seek(0)
             df = pd.read_csv(file, encoding='utf-8-sig')
-        except:
-            pass
+        except: pass
 
-    # STRATEGY 3: CSV (CP932 / Shift-JIS)
+    # Try CSV (Japanese Shift-JIS)
     if df is None:
         try:
             file.seek(0)
             df = pd.read_csv(file, encoding='cp932')
-        except:
-            pass
+        except: pass
 
-    if df is None:
-        st.error("Could not read the file. Please ensure it is a valid .xlsx or .csv file.")
-        return pd.DataFrame()
+    if df is None: return pd.DataFrame()
 
-    # Normalize Headers
+    # Clean Headers
     df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+# --- 4. PARSER LOGIC ---
+def parse_transactions(df):
+    transactions = []
     
-    # Identify Columns
+    # Find Columns
     date_col = next((c for c in df.columns if "取引日" in c), None)
     amt_col = next((c for c in df.columns if "入出金" in c and "内容" not in c), None)
     desc_col = next((c for c in df.columns if "内容" in c), None)
     
     if not all([date_col, amt_col, desc_col]):
-        st.error(f"Error: Columns not found. Found: {list(df.columns)}")
+        st.error(f"❌ Columns not found. We need '取引日', '入出金', '内容'. Found: {list(df.columns)}")
         return pd.DataFrame()
 
-    # Process Rows
     for _, row in df.iterrows():
         try:
-            # A. DESCRIPTION & NORMALIZE
-            raw_desc = str(row[desc_col]).strip()
-            norm_desc = normalize_japanese_text(raw_desc)
+            # 1. Clean Description
+            raw_desc = str(row[desc_col])
+            clean_desc = smart_normalize(raw_desc)
             
-            # B. SKIP LOGIC
-            if any(keyword in norm_desc for keyword in SKIP_KEYWORDS):
-                continue
+            # 2. Skip Logic
+            if any(k in clean_desc for k in SKIP_KEYWORDS): continue
             
-            # C. CLEAN VENDOR NAME
-            # Remove (依頼人...)
-            clean_desc = norm_desc.split(' (依頼人')[0]
-            clean_desc = clean_desc.split('(依頼人')[0]
-            
-            # Remove Bank Name prefixes
-            # Logic: If 4+ spaces and starts with Bank, take the tail
-            parts = clean_desc.split(' ')
-            if len(parts) >= 4 and any(b in parts[0] for b in ['銀行', '金庫', '組合']):
-                vendor_name = " ".join(parts[4:]) 
-            else:
-                vendor_name = clean_desc
-
-            vendor_name = vendor_name.strip()
-
-            # D. AMOUNT
+            # 3. Clean Amount
             val = row[amt_col]
             if pd.isna(val): continue
+            amount = int(float(str(val).replace(',', '')))
             
-            if isinstance(val, str):
-                amount = int(float(val.replace(',', '')))
-            else:
-                amount = int(val)
-            
-            # E. DATE
+            # 4. Clean Date
             raw_date = row[date_col]
             if isinstance(raw_date, pd.Timestamp):
                 date_str = raw_date.strftime("%Y/%m/%d")
             else:
-                s_date = str(raw_date).replace('/', '')
-                if len(s_date) == 8:
-                    date_str = f"{s_date[:4]}/{s_date[4:6]}/{s_date[6:]}"
-                else:
-                    date_str = str(raw_date)
+                s = str(raw_date).replace('/', '')
+                date_str = f"{s[:4]}/{s[4:6]}/{s[6:]}" if len(s) == 8 else str(raw_date)
 
-            # Only Keep Withdrawals
+            # 5. Only Withdrawals
             if amount < 0:
                 transactions.append({
                     "Date": date_str,
-                    "Bank Description": vendor_name,
+                    "Bank Description": clean_desc, # We keep the FULL string (Safe!)
                     "Amount": abs(amount)
                 })
-
-        except Exception:
+        except:
             continue
             
     return pd.DataFrame(transactions)
 
-# --- 5. GOOGLE SHEETS HELPERS ---
-def load_bank_mapping(sheet_url):
+# --- 5. GOOGLE SHEETS ---
+def get_gsheet_client():
+    if "gcp_service_account" not in st.secrets:
+        st.error("Secrets not found.")
+        st.stop()
+    creds = Credentials.from_service_account_info(
+        dict(st.secrets["gcp_service_account"]),
+        scopes=['https://www.googleapis.com/auth/spreadsheets']
+    )
+    return gspread.authorize(creds)
+
+def load_mapping(sheet_url):
     try:
-        scopes = ['https://www.googleapis.com/auth/spreadsheets']
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        client = gspread.authorize(creds)
+        client = get_gsheet_client()
         sheet = client.open_by_url(sheet_url).worksheet("Bank Mapping")
+        # Read as dict: { "タカナシハンバイ": "Takanashi Sales" }
         records = sheet.get_all_values()
         mapping = {}
         for row in records[1:]:
             if len(row) >= 2 and row[0]:
-                # Keys in mapping sheet should also be normalized!
-                key = normalize_japanese_text(row[0])
+                # Normalize the key too!
+                key = smart_normalize(row[0])
                 mapping[key] = row[1].strip()
         return mapping
-    except:
-        return {}
+    except: return {}
 
-def add_unknowns_to_sheet(sheet_url, new_names):
+def add_mapping(sheet_url, bank_name, system_name=""):
     try:
-        scopes = ['https://www.googleapis.com/auth/spreadsheets']
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        client = gspread.authorize(creds)
+        client = get_gsheet_client()
         sheet = client.open_by_url(sheet_url).worksheet("Bank Mapping")
-        rows = [[name, ""] for name in new_names]
-        sheet.append_rows(rows)
+        sheet.append_row([bank_name, system_name])
         return True
-    except:
-        return False
+    except: return False
 
 # --- 6. MAIN APP ---
 st.title("⚖️ Monthly Reconciliation")
 
-with st.sidebar:
-    st.header("⚙️ Configuration")
-    sheet_url = st.text_input("Google Sheet URL", placeholder="https://docs.google.com/spreadsheets/d/...")
+sheet_url = st.sidebar.text_input("Google Sheet URL", placeholder="https://docs.google.com...")
+if not sheet_url: st.stop()
 
-if not sheet_url:
-    st.info("Please enter your Google Sheet URL.")
-    st.stop()
-
-# UPLOAD
-uploaded_file = st.file_uploader("1. Upload Bank File (Excel or CSV)", type=["xlsx", "csv"])
+uploaded_file = st.file_uploader("1. Upload Bank File", type=["xlsx", "csv"])
 
 if uploaded_file:
-    # Use Universal Parser
-    bank_df = parse_rakuten_file(uploaded_file)
-    
-    if bank_df.empty:
-        st.error("No valid transactions found. Please check the file.")
+    # A. Read & Parse
+    raw_df = read_rakuten_file(uploaded_file)
+    if raw_df.empty:
+        st.error("Could not read file.")
         st.stop()
         
-    st.success(f"✅ Loaded {len(bank_df)} transactions.")
-    
-    # Optional: Debug view to see if text is fixed
-    with st.expander("🔍 Check Parsed Names (Debug)"):
-        st.dataframe(bank_df.head())
+    bank_df = parse_transactions(raw_df)
+    st.success(f"✅ Loaded {len(bank_df)} withdrawals.")
 
-    # LOAD SYSTEM DATA
+    # B. Load System Data
+    client = get_gsheet_client()
     try:
-        scopes = ['https://www.googleapis.com/auth/spreadsheets']
-        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-        client = gspread.authorize(creds)
-        sheet = client.open_by_url(sheet_url).sheet1
-        sys_df = pd.DataFrame(sheet.get_all_records())
+        sys_data = client.open_by_url(sheet_url).sheet1.get_all_records()
+        sys_df = pd.DataFrame(sys_data)
         
-        status_col = next((c for c in sys_df.columns if "Status" in c), None)
-        fb_col = next((c for c in sys_df.columns if "FB" in c and "Amount" in c), None)
-        vendor_col = next((c for c in sys_df.columns if "Vendor" in c), None)
-        
-        if not all([status_col, fb_col, vendor_col]):
-            st.error("Google Sheet missing required columns.")
+        # Check cols
+        if not all(k in sys_df.columns for k in ["Status", "Vendor Name", "FB Amount"]):
+            st.error("Sheet needs columns: Status, Vendor Name, FB Amount")
             st.stop()
             
-        paid_invoices = sys_df[sys_df[status_col] == "Paid"].copy()
+        paid_invoices = sys_df[sys_df["Status"] == "Paid"].copy()
     except Exception as e:
-        st.error(f"Error loading Google Sheet: {e}")
+        st.error(f"Sheet Error: {e}")
         st.stop()
 
-    # MATCHING
-    mapping_dict = load_bank_mapping(sheet_url)
+    # C. Smart Matching Logic
+    mapping = load_mapping(sheet_url)
+    
     matches = []
-    unmatched_bank = []
-    unknown_names = set()
+    unmatched = []
     
-    for idx, row in bank_df.iterrows():
+    for _, row in bank_df.iterrows():
         bank_desc = row['Bank Description']
-        bank_amt = row['Amount']
+        amount = row['Amount']
         
-        # Translate
-        trans_name = "Unknown"
-        if bank_desc in mapping_dict:
-            trans_name = mapping_dict[bank_desc]
+        # 1. Find mapped name
+        # Logic: Does the long Bank Description CONTAIN any key from our mapping?
+        # This handles prefixes/suffixes automatically!
+        matched_name = None
+        
+        for key, val in mapping.items():
+            if key in bank_desc: # "MITSUBISHI... YASAKA..." contains "YASAKA"
+                matched_name = val
+                break
+        
+        # 2. Match with System
+        status = "❌ Missing"
+        if matched_name:
+            # Look for Vendor + Amount in System
+            sys_match = paid_invoices[
+                (paid_invoices["Vendor Name"] == matched_name) & 
+                (paid_invoices["FB Amount"] == amount)
+            ]
+            if not sys_match.empty:
+                status = "✅ Match"
+        
+        item = {
+            "Date": row['Date'],
+            "Bank Description": bank_desc,
+            "Mapped Vendor": matched_name if matched_name else "Unknown",
+            "Amount": f"¥{amount:,.0f}",
+            "Status": status
+        }
+        
+        if status == "✅ Match":
+            matches.append(item)
         else:
-            for k, v in mapping_dict.items():
-                if k in bank_desc:
-                    trans_name = v
-                    break
-        
-        if trans_name == "Unknown":
-            unknown_names.add(bank_desc)
-            
-        # Match
-        match = paid_invoices[
-            (paid_invoices[vendor_col] == trans_name) & 
-            (paid_invoices[fb_col] == bank_amt)
-        ]
-        
-        if not match.empty:
-            matches.append({
-                "Date": row['Date'],
-                "Bank Name": bank_desc,
-                "System Name": trans_name,
-                "Amount": f"¥{bank_amt:,.0f}",
-                "Status": "✅ Match"
-            })
-        else:
-            unmatched_bank.append({
-                "Date": row['Date'],
-                "Bank Name": bank_desc,
-                "Translated": trans_name,
-                "Amount": f"¥{bank_amt:,.0f}",
-                "Status": "❌ Missing"
-            })
+            unmatched.append(item)
 
-    # DISPLAY
+    # D. Display
     st.divider()
-    
-    if unknown_names:
-        st.warning(f"Found {len(unknown_names)} unknown vendor names.")
-        col_act1, col_act2 = st.columns([1, 2])
-        with col_act1:
-            if st.button("☁️ Auto-Add Unknowns to Mapping Sheet", type="primary"):
-                with st.spinner("Saving..."):
-                    if add_unknowns_to_sheet(sheet_url, list(unknown_names)):
-                        st.success("Added! Open 'Bank Mapping' tab to edit.")
-                        time.sleep(2)
-                        st.rerun()
-
     c1, c2 = st.columns(2)
+    
     with c1:
         st.subheader(f"✅ Matched ({len(matches)})")
-        if matches:
-            st.dataframe(pd.DataFrame(matches), hide_index=True, use_container_width=True)
-        else:
-            st.info("No matches yet.")
+        st.dataframe(matches, use_container_width=True)
 
     with c2:
-        st.subheader(f"❌ Unmatched ({len(unmatched_bank)})")
-        if unmatched_bank:
-            st.dataframe(pd.DataFrame(unmatched_bank), hide_index=True, use_container_width=True)
+        st.subheader(f"❌ Unmatched ({len(unmatched)})")
+        st.dataframe(unmatched, use_container_width=True)
+        
+        # E. Quick Add to Mapping
+        if unmatched:
+            st.write("---")
+            st.write("### 📝 Quick Map")
+            # Select an unmatched item to map
+            options = [u['Bank Description'] for u in unmatched if u['Mapped Vendor'] == "Unknown"]
+            if options:
+                selected_desc = st.selectbox("Select Bank Description to Map", options)
+                new_alias = st.text_input("Enter Key Word (e.g. 'ヤサカ')", help="Copy the unique part of the bank name here.")
+                
+                if st.button("Save to Mapping Sheet"):
+                    if new_alias:
+                        # We save the ALIAS (Short name) -> English Name
+                        # But wait, usually we want to map:
+                        # "ヤサカ" -> "Yasaka Taxi"
+                        # User needs to ensure the Mapping Sheet has "Yasaka Taxi" in Col B.
+                        
+                        add_mapping(sheet_url, new_alias, "") 
+                        st.success(f"Added '{new_alias}' to mapping! Go to your sheet and add the English name in Column B.")
+                        time.sleep(3)
+                        st.rerun()
