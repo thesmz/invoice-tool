@@ -57,7 +57,7 @@ def parse_transactions(df):
     desc_col = next((c for c in df.columns if "内容" in c), None)
     
     if not all([date_col, amt_col, desc_col]):
-        st.error(f"❌ Columns not found. We need '取引日', '入出金', '内容'. Found: {list(df.columns)}")
+        st.error(f"❌ Bank File Error. Need '取引日', '入出金', '内容'. Found: {list(df.columns)}")
         return pd.DataFrame()
 
     for _, row in df.iterrows():
@@ -88,7 +88,7 @@ def parse_transactions(df):
             
     return pd.DataFrame(transactions)
 
-# --- 5. GOOGLE SHEETS ---
+# --- 5. GOOGLE SHEETS FUNCTIONS ---
 def get_gsheet_client():
     if "gcp_service_account" not in st.secrets:
         st.error("Secrets not found.")
@@ -123,9 +123,27 @@ def add_mapping(sheet_url, bank_name, system_name=""):
 # --- 6. MAIN APP ---
 st.title("⚖️ Monthly Reconciliation")
 
-sheet_url = st.sidebar.text_input("Google Sheet URL", placeholder="https://docs.google.com...")
-if not sheet_url: st.stop()
+# --- SIDEBAR: SHEET SELECTION ---
+with st.sidebar:
+    st.header("⚙️ Configuration")
+    sheet_url = st.text_input("Google Sheet URL", placeholder="https://docs.google.com...")
+    
+    selected_sheet = None
+    if sheet_url:
+        try:
+            client = get_gsheet_client()
+            sh = client.open_by_url(sheet_url)
+            # List all tabs
+            worksheets = [s.title for s in sh.worksheets()]
+            selected_sheet = st.selectbox("Select Invoice Tab", worksheets, index=0)
+        except:
+            st.error("Invalid URL")
 
+if not sheet_url or not selected_sheet:
+    st.info("Please enter a valid Google Sheet URL.")
+    st.stop()
+
+# --- 1. UPLOAD ---
 uploaded_file = st.file_uploader("1. Upload Bank File", type=["xlsx", "csv"])
 
 if uploaded_file:
@@ -138,37 +156,38 @@ if uploaded_file:
     bank_df = parse_transactions(raw_df)
     st.success(f"✅ Loaded {len(bank_df)} withdrawals.")
 
-    # B. Load System Data (FIXED: SMART COLUMN FINDER)
-    client = get_gsheet_client()
+    # B. Load System Data (FROM SELECTED TAB)
     try:
-        sys_data = client.open_by_url(sheet_url).sheet1.get_all_records()
+        # Load data from the USER SELECTED tab
+        sys_data = sh.worksheet(selected_sheet).get_all_records()
         sys_df = pd.DataFrame(sys_data)
         
-        # --- FIX STARTS HERE ---
-        # Look for columns that *contain* keywords instead of exact match
+        # Check if empty
+        if sys_df.empty:
+            st.error(f"❌ The tab '{selected_sheet}' is empty! Please select the tab with your invoice data.")
+            st.stop()
+
+        # Smart Column Finder
         status_col = next((c for c in sys_df.columns if "Status" in c), None)
         vendor_col = next((c for c in sys_df.columns if "Vendor" in c), None)
         fb_col = next((c for c in sys_df.columns if "FB" in c and "Amount" in c), None)
         
         if not all([status_col, vendor_col, fb_col]):
-            st.error(f"❌ Missing columns! Found: {list(sys_df.columns)}. Need: 'Status', 'Vendor', 'FB Amount'")
+            st.error(f"❌ Missing columns in '{selected_sheet}'. Found: {list(sys_df.columns)}. Need: Status, Vendor, FB Amount")
             st.stop()
             
-        # Rename them internally so the rest of the code works
         paid_invoices = sys_df[sys_df[status_col] == "Paid"].copy()
         paid_invoices = paid_invoices.rename(columns={
             vendor_col: "Vendor Name",
             fb_col: "FB Amount"
         })
-        # --- FIX ENDS HERE ---
         
     except Exception as e:
         st.error(f"Sheet Error: {e}")
         st.stop()
 
-    # C. Smart Matching Logic
+    # C. Matching
     mapping = load_mapping(sheet_url)
-    
     matches = []
     unmatched = []
     
@@ -176,7 +195,7 @@ if uploaded_file:
         bank_desc = row['Bank Description']
         amount = row['Amount']
         
-        # 1. Match Mapping
+        # 1. Match Mapping (Contains Logic)
         matched_name = None
         for key, val in mapping.items():
             if key in bank_desc: 
